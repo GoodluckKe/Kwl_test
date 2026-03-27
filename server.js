@@ -22,11 +22,13 @@ const {
   SECONDME_API_BASE_URL = "https://api.mindverse.com/gate/lab",
   UPSTASH_REDIS_REST_URL = "",
   UPSTASH_REDIS_REST_TOKEN = "",
+  SESSION_SECRET = "",
 } = process.env;
 
 const sessions = new Map();
 const SESSION_TTL_SEC = 60 * 60 * 24 * 30;
 const redisEnabled = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+const SESSION_COOKIE_NAME = "session_data";
 const RANK_PHASES = ["前期", "中期", "后期"];
 const RANK_STEP_EXP = 100;
 const RANK_GAIN_WIN = 20;
@@ -709,8 +711,89 @@ function parseCookies(req) {
   return out;
 }
 
-function setCookie(res, key, value, maxAgeSec) {
-  const nextValue = `${key}=${encodeURIComponent(value)}; HttpOnly; Path=/; Max-Age=${maxAgeSec}; SameSite=Lax`;
+function isSecureRequest(req) {
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0];
+  return forwardedProto === "https" || Boolean(process.env.VERCEL);
+}
+
+function shouldUseCookieSession(req) {
+  return !redisEnabled && Boolean(process.env.VERCEL || String(req?.headers?.host || "").includes(".vercel.app"));
+}
+
+function sessionCipherKey() {
+  return crypto.createHash("sha256").update(SESSION_SECRET || SECONDME_CLIENT_SECRET || "shenji-duel-session").digest();
+}
+
+function pickUserSnapshot(user) {
+  if (!user || typeof user !== "object") return null;
+  const keys = [
+    "id",
+    "uid",
+    "userId",
+    "oauthId",
+    "nickname",
+    "name",
+    "displayName",
+    "avatar",
+    "avatarUrl",
+    "headImg",
+    "bio",
+    "intro",
+    "signature",
+    "city",
+    "country",
+    "language",
+  ];
+  return Object.fromEntries(keys.map((key) => [key, user[key]]).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+}
+
+function pickSessionSnapshot(session) {
+  return {
+    user: pickUserSnapshot(session?.user),
+    token: session?.token
+      ? {
+          accessToken: session.token.accessToken,
+          refreshToken: session.token.refreshToken,
+          tokenType: session.token.tokenType,
+          expiresIn: session.token.expiresIn,
+          scope: session.token.scope,
+        }
+      : null,
+    rankProgress: ensureRankProgress(session || createAnonymousSession()),
+    createdAt: session?.createdAt || Date.now(),
+  };
+}
+
+function sealSessionCookie(session) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", sessionCipherKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(pickSessionSnapshot(session)), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString("base64url");
+}
+
+function unsealSessionCookie(payload) {
+  try {
+    const buffer = Buffer.from(String(payload || ""), "base64url");
+    if (buffer.length < 29) return null;
+    const iv = buffer.subarray(0, 12);
+    const tag = buffer.subarray(12, 28);
+    const encrypted = buffer.subarray(28);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", sessionCipherKey(), iv);
+    decipher.setAuthTag(tag);
+    const json = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+    const session = JSON.parse(json);
+    if (session && !Array.isArray(session.friends)) session.friends = [];
+    if (session) ensureRankProgress(session);
+    return session;
+  } catch {
+    return null;
+  }
+}
+
+function setCookie(res, key, value, maxAgeSec, options = {}) {
+  const secure = options.secure ? "; Secure" : "";
+  const nextValue = `${key}=${encodeURIComponent(value)}; HttpOnly; Path=/; Max-Age=${maxAgeSec}; SameSite=Lax${secure}`;
   const existing = res.getHeader("Set-Cookie");
   if (!existing) {
     res.setHeader("Set-Cookie", nextValue);
@@ -723,8 +806,9 @@ function setCookie(res, key, value, maxAgeSec) {
   res.setHeader("Set-Cookie", [existing, nextValue]);
 }
 
-function clearCookie(res, key) {
-  const nextValue = `${key}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`;
+function clearCookie(res, key, options = {}) {
+  const secure = options.secure ? "; Secure" : "";
+  const nextValue = `${key}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`;
   const existing = res.getHeader("Set-Cookie");
   if (!existing) {
     res.setHeader("Set-Cookie", nextValue);
@@ -790,6 +874,17 @@ async function saveStoredSession(sid, session) {
   }
 }
 
+async function persistSession(req, res, sid, session) {
+  ensureRankProgress(session);
+  if (shouldUseCookieSession(req)) {
+    setCookie(res, SESSION_COOKIE_NAME, sealSessionCookie(session), SESSION_TTL_SEC, { secure: isSecureRequest(req) });
+    clearCookie(res, "sid", { secure: isSecureRequest(req) });
+    return;
+  }
+  await saveStoredSession(sid, session);
+  setCookie(res, "sid", sid, SESSION_TTL_SEC, { secure: isSecureRequest(req) });
+}
+
 async function deleteStoredSession(sid) {
   if (!sid) return;
   const existing = await getStoredSession(sid);
@@ -829,6 +924,15 @@ async function findStoredSessionByUser(user) {
 
 async function getSessionFromRequest(req) {
   const cookies = parseCookies(req);
+  const sealedSession = cookies[SESSION_COOKIE_NAME] || "";
+  if (sealedSession) {
+    const session = unsealSessionCookie(sealedSession);
+    if (session) {
+      if (!Array.isArray(session.friends)) session.friends = [];
+      ensureRankProgress(session);
+      return { cookies, sid: "", session };
+    }
+  }
   const sid = cookies.sid || "";
   const session = sid ? await getStoredSession(sid) : null;
   if (session) {
@@ -843,8 +947,7 @@ async function getOrCreateSession(req, res) {
   if (session) return { cookies, sid, session };
   const nextSid = crypto.randomBytes(24).toString("hex");
   const nextSession = createAnonymousSession();
-  await saveStoredSession(nextSid, nextSession);
-  setCookie(res, "sid", nextSid, SESSION_TTL_SEC);
+  await persistSession(req, res, nextSid, nextSession);
   return { cookies, sid: nextSid, session: nextSession };
 }
 
@@ -3170,7 +3273,7 @@ function renderQuickBattlePage(user, options = {}) {
 app.get("/login", (req, res) => {
   if (!requireConfig(res)) return;
   const state = crypto.randomBytes(16).toString("hex");
-  setCookie(res, "oauth_state", state, 600);
+  setCookie(res, "oauth_state", state, 600, { secure: isSecureRequest(req) });
   const params = new URLSearchParams({
     client_id: SECONDME_CLIENT_ID,
     redirect_uri: SECONDME_REDIRECT_URI,
@@ -3183,8 +3286,9 @@ app.get("/login", (req, res) => {
 app.get("/logout", async (req, res) => {
   const cookies = parseCookies(req);
   if (cookies.sid) await deleteStoredSession(cookies.sid);
-  clearCookie(res, "sid");
-  clearCookie(res, "oauth_state");
+  clearCookie(res, "sid", { secure: isSecureRequest(req) });
+  clearCookie(res, SESSION_COOKIE_NAME, { secure: isSecureRequest(req) });
+  clearCookie(res, "oauth_state", { secure: isSecureRequest(req) });
   res.redirect("/");
 });
 
@@ -3238,15 +3342,15 @@ app.get("/api/auth/callback", async (req, res) => {
     const friends = await fetchSecondMeFriends(accessToken);
 
     const sid = existingSid || crypto.randomBytes(24).toString("hex");
-    await saveStoredSession(sid, {
+    const nextSession = {
       user: userJson.data,
       token: tokenJson.data,
       friends,
       rankProgress: createRankProgress(existingSession?.rankProgress?.score || 0),
       createdAt: existingSession?.createdAt || Date.now(),
-    });
-    setCookie(res, "sid", sid, SESSION_TTL_SEC);
-    clearCookie(res, "oauth_state");
+    };
+    await persistSession(req, res, sid, nextSession);
+    clearCookie(res, "oauth_state", { secure: isSecureRequest(req) });
     res.redirect("/");
   } catch (e) {
     res.status(500).send(`<pre>${e instanceof Error ? e.message : String(e)}</pre><p><a href="/">返回首页</a></p>`);
@@ -3351,7 +3455,7 @@ app.post("/api/ranked/result", async (req, res) => {
   const delta = outcome === "win" ? RANK_GAIN_WIN : RANK_GAIN_LOSS;
   rankProgress.score = Math.max(0, rankProgress.score + delta);
   rankProgress.updatedAt = Date.now();
-  await saveStoredSession(sid, session);
+  await persistSession(req, res, sid || crypto.randomBytes(24).toString("hex"), session);
   res.json({
     ok: true,
     delta,
