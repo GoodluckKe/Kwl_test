@@ -34,6 +34,11 @@
 - Vercel KV
 - Supabase / Postgres
 
+当前代码已经支持：
+
+- 有 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN` 时，优先使用 Upstash Redis
+- 没有时，自动回退到内存模式
+
 ## 3. MCP 接口设计
 
 当前最小工具面如下：
@@ -87,6 +92,8 @@ SECONDME_CLIENT_SECRET=...
 SECONDME_REDIRECT_URI=https://your-domain.vercel.app/api/auth/callback
 SECONDME_OAUTH_URL=https://go.second.me/oauth/
 SECONDME_API_BASE_URL=https://api.mindverse.com/gate/lab
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
 ```
 
 ## 6. SecondMe Develop 必须同步修改
@@ -132,8 +139,10 @@ vercel --prod
 4. 回调后确认头像、个人信息、好友列表
 5. 打开英雄图鉴 / 卡牌图鉴
 6. 进入快速战斗
-7. 访问 `GET /api/integration/manifest`
-8. 用 bearer token 调 `POST /api/integration/call`
+7. 进入排位赛并验证段位经验变动
+8. 刷新页面后确认登录态和段位仍存在
+9. 访问 `GET /api/integration/manifest`
+10. 用 bearer token 调 `POST /api/integration/call`
 
 ## 9. 提交 SecondMe Integration 前的确认项
 

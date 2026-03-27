@@ -20,9 +20,13 @@ const {
   SECONDME_REDIRECT_URI = "http://localhost:3010/api/auth/callback",
   SECONDME_OAUTH_URL = "https://go.second.me/oauth/",
   SECONDME_API_BASE_URL = "https://api.mindverse.com/gate/lab",
+  UPSTASH_REDIS_REST_URL = "",
+  UPSTASH_REDIS_REST_TOKEN = "",
 } = process.env;
 
 const sessions = new Map();
+const SESSION_TTL_SEC = 60 * 60 * 24 * 30;
+const redisEnabled = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 const RANK_PHASES = ["前期", "中期", "后期"];
 const RANK_STEP_EXP = 100;
 const RANK_GAIN_WIN = 20;
@@ -733,10 +737,100 @@ function clearCookie(res, key) {
   res.setHeader("Set-Cookie", [existing, nextValue]);
 }
 
-function getSessionFromRequest(req) {
+async function redisCommand(command) {
+  if (!redisEnabled) return null;
+  const resp = await fetch(UPSTASH_REDIS_REST_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+  const json = await resp.json().catch(() => null);
+  if (!resp.ok || !json || json.error) {
+    throw new Error(json?.error || `Redis command failed: ${command[0]}`);
+  }
+  return json.result;
+}
+
+async function getStoredSession(sid) {
+  if (!sid) return null;
+  if (!redisEnabled) {
+    const session = sessions.get(sid) || null;
+    if (session) ensureRankProgress(session);
+    return session;
+  }
+  try {
+    const raw = await redisCommand(["GET", `session:${sid}`]);
+    if (!raw) return null;
+    const session = JSON.parse(raw);
+    if (session) {
+      if (!Array.isArray(session.friends)) session.friends = [];
+      ensureRankProgress(session);
+    }
+    return session;
+  } catch {
+    return sessions.get(sid) || null;
+  }
+}
+
+async function saveStoredSession(sid, session) {
+  ensureRankProgress(session);
+  sessions.set(sid, session);
+  if (!redisEnabled) return;
+  try {
+    await redisCommand(["SET", `session:${sid}`, JSON.stringify(session), "EX", String(SESSION_TTL_SEC)]);
+    const stableId = getStableUserId(session.user);
+    if (stableId) {
+      await redisCommand(["SET", `user-session:${stableId}`, sid, "EX", String(SESSION_TTL_SEC)]);
+    }
+  } catch {
+    return;
+  }
+}
+
+async function deleteStoredSession(sid) {
+  if (!sid) return;
+  const existing = await getStoredSession(sid);
+  sessions.delete(sid);
+  if (!redisEnabled) return;
+  try {
+    await redisCommand(["DEL", `session:${sid}`]);
+    const stableId = getStableUserId(existing?.user);
+    if (stableId) {
+      await redisCommand(["DEL", `user-session:${stableId}`]);
+    }
+  } catch {
+    return;
+  }
+}
+
+async function findStoredSessionByUser(user) {
+  const stableId = getStableUserId(user);
+  if (!stableId) return null;
+  if (!redisEnabled) {
+    for (const session of sessions.values()) {
+      if (getStableUserId(session?.user) === stableId) return session;
+    }
+    return null;
+  }
+  try {
+    const sid = await redisCommand(["GET", `user-session:${stableId}`]);
+    if (!sid) return null;
+    return await getStoredSession(String(sid));
+  } catch {
+    for (const session of sessions.values()) {
+      if (getStableUserId(session?.user) === stableId) return session;
+    }
+    return null;
+  }
+}
+
+async function getSessionFromRequest(req) {
   const cookies = parseCookies(req);
   const sid = cookies.sid || "";
-  const session = sid ? sessions.get(sid) : null;
+  const session = sid ? await getStoredSession(sid) : null;
   if (session) {
     if (!Array.isArray(session.friends)) session.friends = [];
     ensureRankProgress(session);
@@ -744,13 +838,13 @@ function getSessionFromRequest(req) {
   return { cookies, sid, session };
 }
 
-function getOrCreateSession(req, res) {
-  const { cookies, sid, session } = getSessionFromRequest(req);
+async function getOrCreateSession(req, res) {
+  const { cookies, sid, session } = await getSessionFromRequest(req);
   if (session) return { cookies, sid, session };
   const nextSid = crypto.randomBytes(24).toString("hex");
   const nextSession = createAnonymousSession();
-  sessions.set(nextSid, nextSession);
-  setCookie(res, "sid", nextSid, 60 * 60 * 24 * 30);
+  await saveStoredSession(nextSid, nextSession);
+  setCookie(res, "sid", nextSid, SESSION_TTL_SEC);
   return { cookies, sid: nextSid, session: nextSession };
 }
 
@@ -1489,15 +1583,6 @@ function getBearerToken(req) {
 
 function getStableUserId(user) {
   return String(user?.id || user?.userId || user?.uid || user?.oauthId || "");
-}
-
-function findSessionByUser(user) {
-  const stableId = getStableUserId(user);
-  if (!stableId) return null;
-  for (const session of sessions.values()) {
-    if (getStableUserId(session?.user) === stableId) return session;
-  }
-  return null;
 }
 
 function normalizeBaseUrl(value) {
@@ -3095,9 +3180,9 @@ app.get("/login", (req, res) => {
   res.redirect(`${SECONDME_OAUTH_URL}?${params.toString()}`);
 });
 
-app.get("/logout", (req, res) => {
+app.get("/logout", async (req, res) => {
   const cookies = parseCookies(req);
-  if (cookies.sid) sessions.delete(cookies.sid);
+  if (cookies.sid) await deleteStoredSession(cookies.sid);
   clearCookie(res, "sid");
   clearCookie(res, "oauth_state");
   res.redirect("/");
@@ -3108,7 +3193,7 @@ app.get("/api/auth/callback", async (req, res) => {
   const code = req.query.code;
   const error = req.query.error;
   const state = req.query.state;
-  const { cookies, sid: existingSid, session: existingSession } = getSessionFromRequest(req);
+  const { cookies, sid: existingSid, session: existingSession } = await getSessionFromRequest(req);
 
   if (error) {
     res.status(400).send(`<pre>OAuth Error: ${String(error)}</pre><p><a href="/">返回首页</a></p>`);
@@ -3153,14 +3238,14 @@ app.get("/api/auth/callback", async (req, res) => {
     const friends = await fetchSecondMeFriends(accessToken);
 
     const sid = existingSid || crypto.randomBytes(24).toString("hex");
-    sessions.set(sid, {
+    await saveStoredSession(sid, {
       user: userJson.data,
       token: tokenJson.data,
       friends,
       rankProgress: createRankProgress(existingSession?.rankProgress?.score || 0),
       createdAt: existingSession?.createdAt || Date.now(),
     });
-    setCookie(res, "sid", sid, 60 * 60 * 24);
+    setCookie(res, "sid", sid, SESSION_TTL_SEC);
     clearCookie(res, "oauth_state");
     res.redirect("/");
   } catch (e) {
@@ -3168,27 +3253,27 @@ app.get("/api/auth/callback", async (req, res) => {
   }
 });
 
-app.get("/battle/quick", (req, res) => {
-  const { session } = getOrCreateSession(req, res);
+app.get("/battle/quick", async (req, res) => {
+  const { session } = await getOrCreateSession(req, res);
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
   res.send(renderQuickBattlePage(session?.user || null, { mode: "quick", selectedHeroId: hero, rankProgress: session.rankProgress }));
 });
 
-app.get("/battle/slaughter", (req, res) => {
-  const { session } = getOrCreateSession(req, res);
+app.get("/battle/slaughter", async (req, res) => {
+  const { session } = await getOrCreateSession(req, res);
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
   res.send(renderQuickBattlePage(session?.user || null, { mode: "slaughter", selectedHeroId: hero, rankProgress: session.rankProgress }));
 });
 
-app.get("/battle/ranked", (req, res) => {
-  const { session } = getOrCreateSession(req, res);
+app.get("/battle/ranked", async (req, res) => {
+  const { session } = await getOrCreateSession(req, res);
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
   res.send(renderQuickBattlePage(session?.user || null, { mode: "ranked", selectedHeroId: hero, rankProgress: session.rankProgress }));
 });
 
-app.get("/tutorial", (req, res) => {
+app.get("/tutorial", async (req, res) => {
   if (!requireConfig(res)) return;
-  const { session } = getOrCreateSession(req, res);
+  const { session } = await getOrCreateSession(req, res);
   res.send(
     renderTutorialPage({
       user: session?.user || null,
@@ -3199,10 +3284,11 @@ app.get("/tutorial", (req, res) => {
 
 app.get("/", async (req, res) => {
   if (!requireConfig(res)) return;
-  const { session } = getOrCreateSession(req, res);
+  const { sid, session } = await getOrCreateSession(req, res);
   if (session?.token?.accessToken) {
     const latestFriends = await fetchSecondMeFriends(session.token.accessToken);
     session.friends = latestFriends;
+    await saveStoredSession(sid, session);
   }
   const html = renderPage({
     isLoggedIn: Boolean(session?.user),
@@ -3214,7 +3300,7 @@ app.get("/", async (req, res) => {
 });
 
 app.post("/api/friends/invite", async (req, res) => {
-  const { session } = getSessionFromRequest(req);
+  const { session } = await getSessionFromRequest(req);
   if (!session?.token?.accessToken) {
     res.status(401).json({ ok: false, error: "unauthorized" });
     return;
@@ -3254,8 +3340,8 @@ app.post("/api/friends/invite", async (req, res) => {
   res.status(502).json({ ok: false, error: "invite_endpoint_unavailable" });
 });
 
-app.post("/api/ranked/result", (req, res) => {
-  const { session } = getOrCreateSession(req, res);
+app.post("/api/ranked/result", async (req, res) => {
+  const { sid, session } = await getOrCreateSession(req, res);
   const outcome = String(req.body?.outcome || "");
   if (outcome !== "win" && outcome !== "loss") {
     res.status(400).json({ ok: false, error: "invalid_outcome" });
@@ -3265,6 +3351,7 @@ app.post("/api/ranked/result", (req, res) => {
   const delta = outcome === "win" ? RANK_GAIN_WIN : RANK_GAIN_LOSS;
   rankProgress.score = Math.max(0, rankProgress.score + delta);
   rankProgress.updatedAt = Date.now();
+  await saveStoredSession(sid, session);
   res.json({
     ok: true,
     delta,
@@ -3314,7 +3401,7 @@ app.post("/api/integration/call", async (req, res) => {
     return;
   }
 
-  const linkedSession = findSessionByUser(upstreamUser);
+  const linkedSession = await findStoredSessionByUser(upstreamUser);
   const rankProgress = linkedSession?.rankProgress || createRankProgress();
   const baseUrl = getAppBaseUrl(req);
 
