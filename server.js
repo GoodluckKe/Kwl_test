@@ -1713,7 +1713,7 @@ function getIntegrationTools(baseUrl) {
       name: "get_player_profile",
       description: "读取当前 SecondMe 用户在神迹对决中的基础资料、头像、排位信息与好友数量。",
       authRequired: true,
-      route: `${baseUrl}/api/integration/call`,
+      route: `${baseUrl}/api/mcp`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1726,7 +1726,7 @@ function getIntegrationTools(baseUrl) {
       name: "list_game_heroes",
       description: "列出神迹对决全部英雄，支持按阵营筛选，返回英雄技能、定位与文化原型信息。",
       authRequired: true,
-      route: `${baseUrl}/api/integration/call`,
+      route: `${baseUrl}/api/mcp`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1739,7 +1739,7 @@ function getIntegrationTools(baseUrl) {
       name: "list_game_cards",
       description: "列出神迹对决卡牌图鉴，支持按神迹牌、命运牌、神器牌筛选。",
       authRequired: true,
-      route: `${baseUrl}/api/integration/call`,
+      route: `${baseUrl}/api/mcp`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1752,7 +1752,7 @@ function getIntegrationTools(baseUrl) {
       name: "create_battle_entry",
       description: "为指定英雄生成快速战斗、排位赛或杀戮模式的深链入口。",
       authRequired: true,
-      route: `${baseUrl}/api/integration/call`,
+      route: `${baseUrl}/api/mcp`,
       inputSchema: {
         type: "object",
         required: ["heroId"],
@@ -1775,12 +1775,163 @@ function getIntegrationManifest(baseUrl) {
       authMode: "bearer_token",
     },
     endpoints: {
+      mcp: `${baseUrl}/api/mcp`,
       manifest: `${baseUrl}/api/integration/manifest`,
       tools: `${baseUrl}/api/integration/tools`,
       call: `${baseUrl}/api/integration/call`,
       health: `${baseUrl}/api/healthz`,
     },
     tools: getIntegrationTools(baseUrl),
+  };
+}
+
+function toMcpToolDefinitions(baseUrl) {
+  return getIntegrationTools(baseUrl).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+}
+
+async function runIntegrationTool(req, tool, input) {
+  const normalizedTool = String(tool || "").trim();
+  const normalizedInput = input && typeof input === "object" ? input : {};
+  if (!normalizedTool) {
+    return { status: 400, body: { ok: false, error: "missing_tool" } };
+  }
+
+  const accessToken = getBearerToken(req);
+  if (!accessToken) {
+    return { status: 401, body: { ok: false, error: "missing_bearer_token" } };
+  }
+
+  const upstreamUser = await fetchSecondMeUser(accessToken);
+  if (!upstreamUser) {
+    return { status: 401, body: { ok: false, error: "invalid_bearer_token" } };
+  }
+
+  const linkedSession = await findStoredSessionByUser(upstreamUser);
+  const rankProgress = linkedSession?.rankProgress || createRankProgress();
+  const baseUrl = getAppBaseUrl(req);
+
+  if (normalizedTool === "get_player_profile") {
+    const includeFriends = Boolean(normalizedInput.includeFriends);
+    const friends = includeFriends ? await fetchSecondMeFriends(accessToken) : [];
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        tool: normalizedTool,
+        data: {
+          viewer: {
+            id: getStableUserId(upstreamUser),
+            name: upstreamUser.nickname || upstreamUser.name || upstreamUser.displayName || "SecondMe 玩家",
+            avatar: getUserAvatarUrl(upstreamUser),
+            bio: upstreamUser.bio || upstreamUser.signature || upstreamUser.intro || "",
+          },
+          rank: getRankMeta(rankProgress.score),
+          friendCount: friends.length,
+        },
+      },
+    };
+  }
+
+  if (normalizedTool === "list_game_heroes") {
+    const faction = typeof normalizedInput.faction === "string" ? normalizedInput.faction.trim() : "";
+    const heroes = flattenHeroes()
+      .filter((hero) => !faction || hero.faction === faction)
+      .map((hero) => ({
+        id: hero.id,
+        name: hero.name,
+        faction: hero.faction,
+        culture: hero.culture,
+        hp: hero.hp,
+        title: hero.title,
+        skill: hero.skill,
+        role: hero.role,
+        posterLine: hero.posterLine,
+        intro: hero.intro,
+      }));
+    return { status: 200, body: { ok: true, tool: normalizedTool, data: { count: heroes.length, heroes } } };
+  }
+
+  if (normalizedTool === "list_game_cards") {
+    const category = typeof normalizedInput.category === "string" ? normalizedInput.category.trim() : "";
+    const cards = flattenCards()
+      .filter((card) => !category || card.category === category)
+      .map((card) => ({
+        id: card.id,
+        name: card.newName,
+        category: card.category,
+        subType: card.subType,
+        quantity: card.quantity,
+        suit: card.suit,
+        badge: card.badge,
+        sceneLine: card.sceneLine,
+        effect: card.effect,
+      }));
+    return { status: 200, body: { ok: true, tool: normalizedTool, data: { count: cards.length, cards } } };
+  }
+
+  if (normalizedTool === "create_battle_entry") {
+    const heroId = typeof normalizedInput.heroId === "string" ? normalizedInput.heroId.trim() : "";
+    const mode = ["quick", "ranked", "slaughter"].includes(String(normalizedInput.mode || "")) ? String(normalizedInput.mode) : "quick";
+    const hero = flattenHeroes().find((item) => item.id === heroId);
+    if (!hero) {
+      return { status: 404, body: { ok: false, error: "hero_not_found" } };
+    }
+    const modeMeta = getBattleModeMeta(mode);
+    const url = `${baseUrl}/battle/${mode}?hero=${encodeURIComponent(hero.id)}`;
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        tool: normalizedTool,
+        data: {
+          mode: modeMeta.key,
+          modeLabel: modeMeta.label,
+          hero: {
+            id: hero.id,
+            name: hero.name,
+            faction: hero.faction,
+            title: hero.title,
+          },
+          url,
+        },
+      },
+    };
+  }
+
+  return { status: 404, body: { ok: false, error: "unknown_tool" } };
+}
+
+function sendMcpResult(res, id, result) {
+  res.json({ jsonrpc: "2.0", id, result });
+}
+
+function sendMcpError(res, id, code, message, data) {
+  res.status(200).json({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message,
+      ...(data ? { data } : {}),
+    },
+  });
+}
+
+function toMcpToolResult(payload, fallbackText) {
+  const structured = payload?.data ?? {};
+  return {
+    content: [
+      {
+        type: "text",
+        text: fallbackText || JSON.stringify(structured, null, 2),
+      },
+    ],
+    structuredContent: structured,
+    isError: false,
   };
 }
 
@@ -3485,118 +3636,95 @@ app.get("/api/integration/tools", (req, res) => {
   });
 });
 
+app.post("/api/mcp", async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const id = Object.prototype.hasOwnProperty.call(body, "id") ? body.id : null;
+  const method = String(body.method || "").trim();
+  const params = body.params && typeof body.params === "object" ? body.params : {};
+  const baseUrl = getAppBaseUrl(req);
+
+  if (!method) {
+    sendMcpError(res, id, -32600, "Invalid Request", { reason: "missing_method" });
+    return;
+  }
+
+  if (method === "initialize") {
+    sendMcpResult(res, id, {
+      protocolVersion: "2025-06-18",
+      capabilities: {
+        tools: {
+          listChanged: false,
+        },
+      },
+      serverInfo: {
+        name: "shenji-duel",
+        version: "1.0.0",
+      },
+      instructions: "Use bearer-token authenticated tool calls to read player profile, browse heroes/cards, or create battle entry links.",
+    });
+    return;
+  }
+
+  if (method === "notifications/initialized") {
+    res.status(202).end();
+    return;
+  }
+
+  if (method === "ping") {
+    sendMcpResult(res, id, {});
+    return;
+  }
+
+  if (method === "tools/list") {
+    sendMcpResult(res, id, {
+      tools: toMcpToolDefinitions(baseUrl),
+    });
+    return;
+  }
+
+  if (method === "tools/call") {
+    const toolName = String(params.name || "").trim();
+    const toolArgs = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
+    const result = await runIntegrationTool(req, toolName, toolArgs);
+    if (!result.body?.ok) {
+      res.status(200).json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: result.body?.error || "tool_call_failed",
+            },
+          ],
+          structuredContent: result.body || {},
+          isError: true,
+        },
+      });
+      return;
+    }
+
+    const summary =
+      toolName === "get_player_profile"
+        ? `已返回玩家资料与排位信息。`
+        : toolName === "list_game_heroes"
+          ? `已返回英雄图鉴结果。`
+          : toolName === "list_game_cards"
+            ? `已返回卡牌图鉴结果。`
+            : `已生成对战入口。`;
+
+    sendMcpResult(res, id, toMcpToolResult(result.body, summary));
+    return;
+  }
+
+  sendMcpError(res, id, -32601, "Method not found", { method });
+});
+
 app.post("/api/integration/call", async (req, res) => {
   const tool = String(req.body?.tool || req.body?.name || "").trim();
   const input = req.body?.input && typeof req.body.input === "object" ? req.body.input : {};
-  if (!tool) {
-    res.status(400).json({ ok: false, error: "missing_tool" });
-    return;
-  }
-
-  const accessToken = getBearerToken(req);
-  if (!accessToken) {
-    res.status(401).json({ ok: false, error: "missing_bearer_token" });
-    return;
-  }
-
-  const upstreamUser = await fetchSecondMeUser(accessToken);
-  if (!upstreamUser) {
-    res.status(401).json({ ok: false, error: "invalid_bearer_token" });
-    return;
-  }
-
-  const linkedSession = await findStoredSessionByUser(upstreamUser);
-  const rankProgress = linkedSession?.rankProgress || createRankProgress();
-  const baseUrl = getAppBaseUrl(req);
-
-  if (tool === "get_player_profile") {
-    const includeFriends = Boolean(input.includeFriends);
-    const friends = includeFriends ? await fetchSecondMeFriends(accessToken) : [];
-    res.json({
-      ok: true,
-      tool,
-      data: {
-        viewer: {
-          id: getStableUserId(upstreamUser),
-          name: upstreamUser.nickname || upstreamUser.name || upstreamUser.displayName || "SecondMe 玩家",
-          avatar: getUserAvatarUrl(upstreamUser),
-          bio: upstreamUser.bio || upstreamUser.signature || upstreamUser.intro || "",
-        },
-        rank: getRankMeta(rankProgress.score),
-        friendCount: friends.length,
-      },
-    });
-    return;
-  }
-
-  if (tool === "list_game_heroes") {
-    const faction = typeof input.faction === "string" ? input.faction.trim() : "";
-    const heroes = flattenHeroes()
-      .filter((hero) => !faction || hero.faction === faction)
-      .map((hero) => ({
-        id: hero.id,
-        name: hero.name,
-        faction: hero.faction,
-        culture: hero.culture,
-        hp: hero.hp,
-        title: hero.title,
-        skill: hero.skill,
-        role: hero.role,
-        posterLine: hero.posterLine,
-        intro: hero.intro,
-      }));
-    res.json({ ok: true, tool, data: { count: heroes.length, heroes } });
-    return;
-  }
-
-  if (tool === "list_game_cards") {
-    const category = typeof input.category === "string" ? input.category.trim() : "";
-    const cards = flattenCards()
-      .filter((card) => !category || card.category === category)
-      .map((card) => ({
-        id: card.id,
-        name: card.newName,
-        category: card.category,
-        subType: card.subType,
-        quantity: card.quantity,
-        suit: card.suit,
-        badge: card.badge,
-        sceneLine: card.sceneLine,
-        effect: card.effect,
-      }));
-    res.json({ ok: true, tool, data: { count: cards.length, cards } });
-    return;
-  }
-
-  if (tool === "create_battle_entry") {
-    const heroId = typeof input.heroId === "string" ? input.heroId.trim() : "";
-    const mode = ["quick", "ranked", "slaughter"].includes(String(input.mode || "")) ? String(input.mode) : "quick";
-    const hero = flattenHeroes().find((item) => item.id === heroId);
-    if (!hero) {
-      res.status(404).json({ ok: false, error: "hero_not_found" });
-      return;
-    }
-    const modeMeta = getBattleModeMeta(mode);
-    const url = `${baseUrl}/battle/${mode}?hero=${encodeURIComponent(hero.id)}`;
-    res.json({
-      ok: true,
-      tool,
-      data: {
-        mode: modeMeta.key,
-        modeLabel: modeMeta.label,
-        hero: {
-          id: hero.id,
-          name: hero.name,
-          faction: hero.faction,
-          title: hero.title,
-        },
-        url,
-      },
-    });
-    return;
-  }
-
-  res.status(404).json({ ok: false, error: "unknown_tool" });
+  const result = await runIntegrationTool(req, tool, input);
+  res.status(result.status).json(result.body);
 });
 
 export default app;
