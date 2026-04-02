@@ -25,14 +25,12 @@ const SESSION_TTL_SEC = 60 * 60 * 24 * 30;
 const redisEnabled = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 const SESSION_COOKIE_NAME = "session_data";
 
+// 检查是否在 Vercel 环境中
+const isVercel = process.env.VERCEL === '1';
+
 // 历史记录存储路径
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const BATTLE_HISTORY_DIR = path.join(__dirname, 'data', 'battle-history');
-
-// 确保历史记录存储目录存在
-if (!fs.existsSync(BATTLE_HISTORY_DIR)) {
-  fs.mkdirSync(BATTLE_HISTORY_DIR, { recursive: true });
-}
 
 // 数据库文件路径
 const DB_PATH = path.join(BATTLE_HISTORY_DIR, 'battle_history.db');
@@ -42,7 +40,18 @@ let db = null;
 
 // 初始化数据库
 async function initDatabase() {
+  // 在 Vercel 环境中，跳过文件系统操作
+  if (isVercel) {
+    console.log("在 Vercel 环境中，跳过数据库初始化");
+    return;
+  }
+  
   try {
+    // 确保历史记录存储目录存在
+    if (!fs.existsSync(BATTLE_HISTORY_DIR)) {
+      fs.mkdirSync(BATTLE_HISTORY_DIR, { recursive: true });
+    }
+    
     db = await open({
       filename: DB_PATH,
       driver: sqlite3.Database
