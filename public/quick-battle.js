@@ -65,6 +65,8 @@
     humanTurnResolver: null,
     rankResultSubmitted: false,
     rankUpdate: null,
+    turnTimer: null,
+    timeLeft: 20,
   };
 
   const refs = {
@@ -82,6 +84,19 @@
     cancelBtn: document.getElementById("qbCancelSelection"),
     autoBtn: document.getElementById("qbAutoRun"),
     refreshBtn: document.getElementById("qbRestart"),
+    chatToggle: document.getElementById("qbChatToggle"),
+    chatPanel: document.getElementById("qbChatPanel"),
+    chatClose: document.getElementById("qbChatClose"),
+    chatMessages: document.getElementById("qbChatMessages"),
+    chatInput: document.getElementById("qbChatInput"),
+    chatSend: document.getElementById("qbChatSend"),
+    voiceToggle: document.getElementById("qbVoiceToggle"),
+    voicePanel: document.getElementById("qbVoicePanel"),
+    voiceClose: document.getElementById("qbVoiceClose"),
+    voiceMessages: document.getElementById("qbVoiceMessages"),
+    voiceInput: document.getElementById("qbVoiceInput"),
+    voiceRecord: document.getElementById("qbVoiceRecord"),
+    voiceSend: document.getElementById("qbVoiceSend"),
     resultOverlay: document.getElementById("qbResult"),
     resultTitle: document.getElementById("qbResultTitle"),
     resultCamp: document.getElementById("qbResultCamp"),
@@ -186,8 +201,9 @@
   }
 
   function roleLabelForSeat(player) {
-    if (player.role === "lord" || player.roleVisible || player.isHuman) return ROLE_INFO[player.role].label;
-    return "身份未明";
+    const human = getPlayerById(state.humanPlayerId);
+    if (player.role === "lord" || player.roleVisible || (human && player.id === human.id)) return ROLE_INFO[player.role].label;
+    return "";
   }
 
   function buildPlayers() {
@@ -197,8 +213,43 @@
     const heroPool = shuffle(allHeroes.filter((hero) => hero.id !== selectedHero?.id)).slice(0, 6);
     const playerRole = roles.shift();
     const playerHero = selectedHero || heroPool.shift();
+    
+    // 如果有匹配的推荐用户信息，使用它
+    if (boot.matchedPlayers && boot.matchedPlayers.length > 0) {
+      const players = [];
+      const matchedPlayers = boot.matchedPlayers;
+      
+      // 第一个玩家是人类玩家
+      players.push(createPlayer(0, 0, playerRole, playerHero, true, boot.viewer?.name || '玩家'));
+      
+      const remainingSeats = [1, 2, 3, 4, 5, 6];
+      const shuffledSeats = shuffle(remainingSeats);
+      
+      // 添加匹配的其他用户
+      for (let i = 1; i < matchedPlayers.length && i < 7; i++) {
+        const matchedPlayer = matchedPlayers[i];
+        const hero = heroPool.length > 0 ? heroPool.shift() : shuffle(allHeroes)[0];
+        const role = roles.length > 0 ? roles.shift() : 'rebel';
+        const seat = shuffledSeats[i - 1] || i;
+        
+        players.push(createPlayer(i, seat, role, hero, matchedPlayer.isHuman || false, matchedPlayer.name || 'SecondMe用户'));
+      }
+      
+      // 如果人数不足7人，生成AI玩家
+      while (players.length < 7 && heroPool.length > 0) {
+        const hero = heroPool.shift();
+        const role = roles.length > 0 ? roles.shift() : 'rebel';
+        const seatIdx = players.length - 1;
+        const seat = shuffledSeats[seatIdx] || players.length;
+        players.push(createPlayer(players.length, seat, role, hero, false, 'AI玩家'));
+      }
+      
+      return players.sort((a, b) => a.seat - b.seat);
+    }
+    
+    // 原来的逻辑：生成AI玩家
     const players = [
-      createPlayer(0, 0, playerRole, playerHero, true),
+      createPlayer(0, 0, playerRole, playerHero, true, boot.viewer?.name || '玩家'),
     ];
 
     const remainingSeats = [1, 2, 3, 4, 5, 6];
@@ -209,30 +260,31 @@
       const lordIndex = remainingRoles.indexOf("lord");
       const lordRole = remainingRoles.splice(lordIndex, 1)[0];
       const lordHero = remainingHeroes.splice(0, 1)[0];
-      players.push(createPlayer(1, 4, lordRole, lordHero, false));
+      players.push(createPlayer(1, 4, lordRole, lordHero, false, 'AI玩家'));
       const shuffledSeats = shuffle([1, 2, 3, 5, 6]);
       remainingRoles.forEach((role, idx) => {
-        players.push(createPlayer(idx + 2, shuffledSeats[idx], role, remainingHeroes[idx], false));
+        players.push(createPlayer(idx + 2, shuffledSeats[idx], role, remainingHeroes[idx], false, 'AI玩家'));
       });
     } else {
       const shuffledSeats = shuffle(remainingSeats);
       remainingRoles.forEach((role, idx) => {
-        players.push(createPlayer(idx + 1, shuffledSeats[idx], role, remainingHeroes[idx], false));
+        players.push(createPlayer(idx + 1, shuffledSeats[idx], role, remainingHeroes[idx], false, 'AI玩家'));
       });
     }
 
     return players.sort((a, b) => a.seat - b.seat);
   }
 
-  function createPlayer(id, seat, role, hero, isHuman) {
+  function createPlayer(id, seat, role, hero, isHuman, name) {
     const maxHp = hero.hp + (role === "lord" ? 1 : 0);
     return {
       id,
       seat,
       role,
-      roleVisible: role === "lord" || isHuman,
+      roleVisible: role === "lord",
       isHuman,
       dead: false,
+      name,
       hero,
       faction: hero.faction,
       maxHp,
@@ -364,10 +416,11 @@
   }
 
   function tendencyHint(player) {
-    if (player.roleVisible || player.isHuman) return "身份明确";
+    const human = getPlayerById(state.humanPlayerId);
+    if (player.roleVisible || (human && player.id === human.id)) return "身份明确";
     if (player.tendency <= -3) return "反贼倾向";
     if (player.tendency >= 3) return "忠臣倾向";
-    return "倾向未明";
+    return "倾向?";
   }
 
   function updateTendency(actor, action, target) {
@@ -571,9 +624,35 @@
     applyDamage(actor, target, options.damage || 1, options.cardName);
   }
 
+  async function playCardVoice(cardName) {
+    try {
+      const response = await fetch(`/card-voices/${encodeURIComponent(cardName)}.json`);
+      if (!response.ok) return;
+      const voiceLines = await response.json();
+      if (Array.isArray(voiceLines) && voiceLines.length > 0) {
+        const randomLine = voiceLines[Math.floor(Math.random() * voiceLines.length)];
+        // 创建语音合成
+        const utterance = new SpeechSynthesisUtterance(randomLine);
+        utterance.lang = 'zh-CN';
+        utterance.volume = 0.8;
+        speechSynthesis.speak(utterance);
+      }
+    } catch (error) {
+      console.error('播放卡牌语音失败:', error);
+    }
+  }
+
   function useCard(actor, card, targetIds) {
     const consume = removeHandCard(actor, card.uid);
     if (!consume) return false;
+
+    // 播放卡牌出场语音
+    playCardVoice(card.name);
+
+    // 刷新出牌时间限制
+    if (actor.isHuman) {
+      refreshTurnTimer();
+    }
 
     const target = targetIds && targetIds.length ? getPlayerById(targetIds[0]) : null;
     const allTargets = (targetIds || []).map((id) => getPlayerById(id)).filter(Boolean);
@@ -794,23 +873,168 @@
       actor.turnFlags.berserkUsed = true;
       addLog(`${actor.hero.name} 发动【狂战】，本回合【神击】伤害 +1。`, "fate");
       renderAll();
-      await wait(420);
+      await wait(1000);
     }
 
+    const maxLoops = 5;
     let loops = 0;
-    while (!state.gameOver && loops < 5) {
+
+    while (!state.gameOver && loops < maxLoops) {
       loops += 1;
-      const target = choosePriorityTarget(actor);
-      const played =
-        tryHealFromHand(actor)
-        || tryEquipFromHand(actor)
-        || tryDelayedFromHand(actor, target)
-        || tryTrickFromHand(actor, target)
-        || tryAttackFromHand(actor, target);
-      if (!played) break;
-      renderAll();
-      await wait(520);
+      
+      if (actor.hand.length === 0) {
+        addLog(`${actor.hero.name} 没有手牌，跳过出牌。`, "think");
+        break;
+      }
+
+      setBanner(`${actor.hero.name} 正在思考第 ${loops} 步...`);
+      addLog(`${actor.hero.name} 正在思考出牌策略...`, "think");
+
+      try {
+        const gameStateNow = buildGameStateForAI(actor);
+        const resp = await fetch("/api/secondme/think", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            gameState: gameStateNow,
+            action: "play",
+            actorId: actor.id,
+            actorName: actor.hero.name,
+            handCards: actor.hand.map(c => c.name),
+          }),
+        });
+        const json = await resp.json();
+        
+        let played = false;
+        
+        if (json.ok && json.decision) {
+          const decision = json.decision;
+          addLog(`SecondMe 思考：${decision.thinking || '无'}`, "think");
+          addLog(`SecondMe 决策：${decision.action} - ${decision.cardName || '无'} ${decision.targetId ? '目标:'+decision.targetId : ''} 原因：${decision.reason || '无'}`, "think");
+          
+          if (decision.action === "pass" || !decision.cardName) {
+            addLog(`${actor.hero.name} 决定不出牌。`, "think");
+            break;
+          }
+          
+          played = await executeSecondMeDecision(actor, decision);
+        } else if (json.ok && json.think) {
+          addLog(`SecondMe 思考结果：${json.think}`, "think");
+          const target = choosePriorityTarget(actor);
+          played = tryHealFromHand(actor) || tryEquipFromHand(actor) || tryDelayedFromHand(actor, target) || tryTrickFromHand(actor, target) || tryAttackFromHand(actor, target);
+        }
+        
+        await wait(1500);
+        
+        if (!played) {
+          const target = choosePriorityTarget(actor);
+          played = tryHealFromHand(actor) || tryEquipFromHand(actor) || tryDelayedFromHand(actor, target) || tryTrickFromHand(actor, target) || tryAttackFromHand(actor, target);
+        }
+        
+        if (!played) {
+          addLog(`${actor.hero.name} 没有可出的牌。`, "think");
+          break;
+        }
+
+        // AI聊天功能
+        if (Math.random() < 0.3) { // 30%的概率发送聊天消息
+          await sendAIChatMessage(actor);
+        }
+
+        renderAll();
+        await wait(1200);
+      } catch (error) {
+        console.error("SecondMe 思考失败，使用备用逻辑:", error);
+        const target = choosePriorityTarget(actor);
+        const played = tryHealFromHand(actor) || tryEquipFromHand(actor) || tryDelayedFromHand(actor, target) || tryTrickFromHand(actor, target) || tryAttackFromHand(actor, target);
+        if (!played) break;
+        renderAll();
+        await wait(1200);
+      }
     }
+  }
+
+  async function executeSecondMeDecision(actor, decision) {
+    if (!decision.cardName) return false;
+    
+    const card = actor.hand.find(c => c.name === decision.cardName);
+    if (!card) {
+      addLog(`${actor.hero.name} 手牌中没有 ${decision.cardName}，无法执行决策。`, "think");
+      return false;
+    }
+    
+    let target = null;
+    if (decision.targetId) {
+      target = getPlayerById(decision.targetId);
+      if (!target) {
+        addLog(`${actor.hero.name} 找不到目标玩家 ${decision.targetId}，无法执行决策。`, "think");
+        return false;
+      }
+    }
+    
+    const SINGLE_TARGET_CARDS = new Set(["神击", "灵药", "天罚", "神谕", "命运纺锤", "雷霆之怒", "潘多拉魔盒", "斯芬克斯之谜", "世界树之缚"]);
+    const EQUIP_CARDS = Object.keys(EQUIP_SLOT);
+    
+    if (SINGLE_TARGET_CARDS.has(card.name) && target) {
+      const result = useCard(actor, card, [target.id]);
+      if (result) {
+        addLog(`${actor.hero.name} 使用【${card.name}】对 ${target.hero.name}，原因：${decision.reason || ''}`, "think");
+      }
+      return result;
+    } else if (EQUIP_CARDS.includes(card.name)) {
+      const result = useCard(actor, card, []);
+      if (result) {
+        addLog(`${actor.hero.name} 使用【${card.name}】装备，原因：${decision.reason || ''}`, "think");
+      }
+      return result;
+    } else {
+      const result = useCard(actor, card, target ? [target.id] : []);
+      if (result) {
+        addLog(`${actor.hero.name} 使用【${card.name}】，原因：${decision.reason || ''}`, "think");
+      }
+      return result;
+    }
+  }
+
+  function buildGameStateForAI(actor) {
+    return {
+      turn: state.turn,
+      phase: state.currentPhase,
+      actor: {
+        id: actor.id,
+        name: actor.hero.name,
+        faction: actor.faction,
+        hp: actor.hp,
+        maxHp: actor.maxHp,
+        hand: actor.hand.map(c => ({
+          name: c.name,
+          type: c.type,
+          suit: c.suit,
+          description: c.description,
+        })),
+        equip: {
+          weapon: actor.equip.weapon?.name || null,
+          armor: actor.equip.armor?.name || null,
+          plusHorse: actor.equip.plusHorse?.name || null,
+          minusHorse: actor.equip.minusHorse?.name || null,
+          relic: actor.equip.relic?.name || null,
+        },
+        judging: actor.judging.map(c => c.name),
+        turnFlags: actor.turnFlags,
+      },
+      players: state.players.filter(p => !p.dead).map(p => ({
+        id: p.id,
+        name: p.hero.name,
+        faction: p.faction,
+        hp: p.hp,
+        maxHp: p.maxHp,
+        isHuman: p.isHuman,
+        role: p.role,
+        distance: Math.abs(p.seat - actor.seat) <= 3 ? Math.abs(p.seat - actor.seat) : 6 - Math.abs(p.seat - actor.seat),
+      })),
+      drawPileCount: state.drawPile.length,
+      discardPileCount: state.discardPile.length,
+    };
   }
 
   function handLimit(player) {
@@ -896,7 +1120,7 @@
       state.currentPhase = phase.key;
       renderAll();
       setBanner(`${player.hero.name} 的 ${phase.label}阶段`);
-      await wait(player.isHuman ? 120 : 360);
+      await wait(player.isHuman ? 120 : 800);
 
       if (phase.key === "prepare") runPreparePhase(player);
       if (phase.key === "judge") runJudgePhase(player);
@@ -907,6 +1131,9 @@
         } else if (player.isHuman && !player.dead) {
           await enterHumanTurn(player);
         } else {
+          // 增加AI思考时间，符合人类反应速度
+          setBanner(`${player.hero.name} 正在思考...`);
+          await wait(1200);
           await runAiPlayPhase(player);
         }
       }
@@ -927,13 +1154,51 @@
     return "再次点击可立即使用。";
   }
 
+  function refreshTurnTimer() {
+    if (state.turnTimer) {
+      clearInterval(state.turnTimer);
+    }
+    state.timeLeft = 20;
+    refreshTurnTimerUI();
+    
+    state.turnTimer = setInterval(() => {
+      state.timeLeft--;
+      refreshTurnTimerUI();
+      if (state.timeLeft < 0) {
+        clearInterval(state.turnTimer);
+        if (state.waitingForHuman) {
+          addLog("出牌时间结束，自动结束回合。", "time");
+          endHumanTurn();
+        }
+      }
+    }, 1000);
+  }
+
+  function refreshTurnTimerUI() {
+    const timerEl = document.getElementById("qbTurnTimer");
+    if (timerEl && state.waitingForHuman && state.timeLeft > 0) {
+      timerEl.textContent = state.timeLeft;
+      timerEl.style.display = "block";
+    } else if (timerEl) {
+      timerEl.style.display = "none";
+    }
+  }
+
   function enterHumanTurn(player) {
     state.waitingForHuman = true;
     state.selectedCardUid = null;
-    refs.hint.textContent = "你的出牌阶段：点击手牌后再点目标，或直接结束阶段。";
+    
+    // 添加20秒出牌时间限制
+    refreshTurnTimer();
+    
     renderHand();
     return new Promise((resolve) => {
-      state.humanTurnResolver = resolve;
+      state.humanTurnResolver = () => {
+        if (state.turnTimer) {
+          clearInterval(state.turnTimer);
+        }
+        resolve();
+      };
     });
   }
 
@@ -943,7 +1208,7 @@
     state.selectedCardUid = null;
     const resolver = state.humanTurnResolver;
     state.humanTurnResolver = null;
-    refs.hint.textContent = "回合继续结算中。";
+    refs.hint.textContent = "结算中...";
     renderAll();
     resolver();
   }
@@ -955,17 +1220,24 @@
 
   function handleHumanCardClick(uid) {
     const player = getPlayerById(state.humanPlayerId);
-    if (!state.waitingForHuman || !player || player.dead || state.currentPlayerId !== player.id || state.currentPhase !== "play") return;
+    const currentPlayerId = typeof state.currentPlayerId === 'string' ? parseInt(state.currentPlayerId) : state.currentPlayerId;
+    const playerId = typeof player?.id === 'string' ? parseInt(player.id) : player?.id;
+    console.log("点击卡牌:", uid, "waitingForHuman:", state.waitingForHuman, "currentPlayerId:", currentPlayerId, "player.id:", playerId, "currentPhase:", state.currentPhase);
+    if (!state.waitingForHuman || !player || player.dead || currentPlayerId !== playerId || state.currentPhase !== "play") {
+      console.log("卡牌点击被阻止: waitingForHuman=", state.waitingForHuman, "player=", !!player, "player.dead=", player?.dead, "currentPlayerId=", currentPlayerId, "player.id=", playerId, "currentPhase=", state.currentPhase);
+      refs.hint.textContent = "非你的回合";
+      return;
+    }
     const card = cardByUid(player, uid);
     if (!card) return;
     if (REACTION_ONLY.has(card.name)) {
-      refs.hint.textContent = `${card.name} 属于响应牌，会在对应时机自动触发。`;
+      refs.hint.textContent = `${card.name}响应`;
       return;
     }
     if (state.selectedCardUid === uid) {
       if (card.name === "神迹") {
         useCard(player, card, []);
-        refs.hint.textContent = "你选择了【神迹】的摸牌选项。";
+        refs.hint.textContent = "摸2张牌";
         state.selectedCardUid = null;
         renderAll();
         return;
@@ -999,18 +1271,20 @@
     if (!state.waitingForHuman || !human || human.dead) return;
     const card = selectedCard();
     if (!card) return;
+    // 确保playerId类型与validTargets中的ID类型一致
+    const normalizedPlayerId = typeof playerId === 'string' && !isNaN(playerId) ? Number(playerId) : playerId;
     const validTargets = validTargetsForCard(human, card);
-    if (!validTargets.includes(playerId)) return;
-    useCard(human, card, [playerId]);
+    if (!validTargets.includes(normalizedPlayerId)) return;
+    useCard(human, card, [normalizedPlayerId]);
     state.selectedCardUid = null;
-    refs.hint.textContent = "已完成一次出牌，可继续操作或结束回合。";
+    refs.hint.textContent = "请选择目标";
     renderAll();
   }
 
   function renderPhaseInfo() {
     const actor = getPlayerById(state.currentPlayerId);
     refs.turnSummary.textContent = `第 ${state.turn} 回合`;
-    refs.actorSummary.textContent = actor ? actor.hero.name : "等待开局";
+    refs.actorSummary.textContent = actor ? `${actor.name || '玩家'}（${actor.hero.name}）` : "等待开局";
     refs.phaseStrip.innerHTML = PHASES.map((phase) => {
       const active = phase.key === state.currentPhase ? "active" : "";
       return `<div class="qb-phase-pill ${active}">${phase.label}</div>`;
@@ -1038,11 +1312,11 @@
           <div class="qb-seat-card">
             <div class="qb-seat-frame"></div>
             <div class="qb-seat-head">
-              <img class="qb-seat-avatar" src="${player.hero.avatar}" alt="${player.hero.name}" />
+              <img class="qb-seat-avatar" src="${player.hero.avatar}" alt="${player.hero.name}" loading="lazy" decoding="async" />
               <div>
-                <div class="qb-seat-name">${player.hero.name}</div>
+                <div class="qb-seat-name">${player.name || '玩家'}（${player.hero.name}）</div>
                 <div class="qb-seat-sub">${player.faction} · ${player.hero.title}</div>
-                <div class="qb-seat-role ${player.roleVisible || player.isHuman ? roleInfo.className : ""}">${roleLabelForSeat(player)}</div>
+                <div class="qb-seat-role ${player.roleVisible ? roleInfo.className : ""}">${roleLabelForSeat(player)}</div>
               </div>
             </div>
             <div class="qb-seat-stats">
@@ -1063,7 +1337,7 @@
       refs.handList.innerHTML = `<div class="qb-empty">观战中，等待本局结束。</div>`;
       return;
     }
-    refs.handMeta.textContent = state.waitingForHuman ? "点击手牌开始出牌" : "当前不是你的出牌阶段";
+    refs.handMeta.textContent = state.waitingForHuman ? "点击卡牌出牌" : "等待回合";
     refs.handList.innerHTML = human.hand.length
       ? human.hand.map((card) => {
         const selected = state.selectedCardUid === card.uid ? "selected" : "";
@@ -1149,6 +1423,39 @@
     renderResultOverlay();
   }
 
+  async function saveBattleHistory() {
+    if (!state.gameOver) return;
+    if (state.battleHistorySaved) return;
+    state.battleHistorySaved = true;
+    try {
+      const human = state.players.find(p => p.id === state.humanPlayerId);
+      if (!human) return;
+      
+      const history = {
+        result: didHumanWin() ? 'win' : 'lose',
+        playerName: human.name || 'Player',
+        playerHero: human.hero.name,
+        opponentName: 'AI Opponent',
+        opponentHero: 'AI Hero',
+        mode: modeConfig.label,
+        timestamp: Date.now()
+      };
+      
+      const response = await fetch('/api/battle/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(history)
+      });
+      
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        console.error('保存战绩失败:', json?.error);
+      }
+    } catch (error) {
+      console.error('保存战绩失败:', error);
+    }
+  }
+
   async function runBattleLoop() {
     const lord = state.players.find((player) => player.role === "lord");
     state.currentPlayerId = lord ? lord.id : 0;
@@ -1164,6 +1471,7 @@
       state.currentPlayerId = next.id;
     }
     await submitRankedResult();
+    await saveBattleHistory();
     renderAll();
   }
 
@@ -1176,28 +1484,446 @@
       }
       const seatEl = event.target.closest("[data-seat-id]");
       if (seatEl) {
-        handleSeatClick(Number(seatEl.dataset.seatId));
+        handleSeatClick(seatEl.dataset.seatId);
         return;
       }
     });
     refs.endTurnBtn.addEventListener("click", () => endHumanTurn());
     refs.cancelBtn.addEventListener("click", () => {
       state.selectedCardUid = null;
-      refs.hint.textContent = "已取消选牌。";
+      refs.hint.textContent = "已取消";
       renderAll();
     });
-    refs.autoBtn.addEventListener("click", () => {
+    refs.autoBtn.addEventListener("click", async () => {
       const human = getPlayerById(state.humanPlayerId);
       if (!human || !state.waitingForHuman || human.dead) return;
-      runAiPlayPhase(human).then(() => endHumanTurn());
+      
+      // 使用 SecondMe 思考
+      try {
+        const gameState = {
+          players: state.players.map(p => ({
+            id: p.id,
+            role: p.role,
+            roleVisible: p.roleVisible,
+            isHuman: p.isHuman,
+            dead: p.dead,
+            hero: p.hero,
+            faction: p.faction,
+            maxHp: p.maxHp,
+            hp: p.hp,
+            hand: p.hand.length,
+            equip: Object.values(p.equip).filter(Boolean).length,
+            turnFlags: p.turnFlags,
+          })),
+          currentPlayerId: state.currentPlayerId,
+          currentPhase: state.currentPhase,
+          turn: state.turn,
+          humanPlayerId: state.humanPlayerId,
+        };
+        
+        setBanner("SecondMe 正在思考...");
+        const resp = await fetch("/api/secondme/think", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gameState, action: "play" }),
+        });
+        const json = await resp.json();
+        if (json.ok) {
+          addLog(`SecondMe 思考结果：${json.think}`, "think");
+        }
+      } catch (error) {
+        console.error("SecondMe 思考失败:", error);
+      }
+      
+      // 执行 AI 出牌
+      await runAiPlayPhase(human);
+      endHumanTurn();
     });
     refs.refreshBtn.addEventListener("click", () => window.location.reload());
+    
+    // 聊天功能
+    if (refs.chatToggle && refs.chatPanel) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const matchId = urlParams.get('matchId');
+      
+      refs.chatToggle.addEventListener("click", () => {
+        refs.chatPanel.style.display = refs.chatPanel.style.display === "none" ? "block" : "none";
+        if (refs.chatPanel.style.display === "block") {
+          loadChatMessages();
+        }
+      });
+      
+      if (refs.chatClose) {
+        refs.chatClose.addEventListener("click", () => {
+          refs.chatPanel.style.display = "none";
+        });
+      }
+      
+      if (refs.chatSend && refs.chatInput) {
+        const sendMessage = async () => {
+          const message = refs.chatInput.value.trim();
+          if (!message || !matchId) return;
+          
+          try {
+            const resp = await fetch(`/api/match/${matchId}/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message })
+            });
+            const json = await resp.json();
+            if (json.ok) {
+              refs.chatInput.value = "";
+              loadChatMessages();
+            }
+          } catch (error) {
+            console.error("发送消息失败:", error);
+          }
+        };
+        
+        refs.chatSend.addEventListener("click", sendMessage);
+        refs.chatInput.addEventListener("keypress", (e) => {
+          if (e.key === "Enter") sendMessage();
+        });
+      }
+      
+      async function loadChatMessages() {
+        if (!matchId || !refs.chatMessages) return;
+        
+        try {
+          const resp = await fetch(`/api/match/${matchId}/chat`);
+          const json = await resp.json();
+          
+          if (json.ok && json.chats && json.chats.length > 0) {
+            refs.chatMessages.innerHTML = json.chats.map(chat => {
+              const time = new Date(chat.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+              const isSelf = String(chat.playerId) === String(state.humanPlayerId);
+              return '<div style="display: flex; flex-direction: column; ' + (isSelf ? 'align-items: flex-end;' : 'align-items: flex-start;') + ';"><span style="font-size: 11px; color: #64748b;">' + chat.playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: ' + (isSelf ? 'rgba(251, 191, 36, 0.2);' : 'rgba(59, 130, 246, 0.2);') + '; color: #eef6ff; font-size: 13px; word-break: break-all;">' + chat.message + '</span></div>';
+            }).join('');
+            refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
+          }
+        } catch (error) {
+          console.error("加载聊天消息失败:", error);
+        }
+      }
+      
+      // 每2秒自动刷新聊天消息，确保实时通信
+      if (matchId) {
+        setInterval(() => {
+          loadChatMessages();
+        }, 2000);
+      }
+      
+      // 页面加载时立即加载聊天消息
+      loadChatMessages();
+    }
+    
+    // AI聊天功能
+    async function sendAIChatMessage(actor) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const matchId = urlParams.get('matchId');
+      if (!matchId) return;
+      
+      // AI聊天消息模板
+      const chatMessages = [
+        `哈哈，${actor.hero.name}的力量无人能敌！`,
+        `你的策略太弱了，准备接受失败吧！`,
+        `看我如何运用这张卡牌击败你！`,
+        `我的阵营必将胜利！`,
+        `你以为这样就能打败我吗？`,
+        `小心了，我的回合才刚刚开始！`,
+        `这张卡牌将改变战局！`,
+        `你的防御不堪一击！`,
+        `胜利属于我！`,
+        `感受${actor.hero.name}的怒火吧！`
+      ];
+      
+      // 随机选择一条消息
+      const randomMessage = chatMessages[Math.floor(Math.random() * chatMessages.length)];
+      
+      try {
+        // 发送消息到聊天
+        const resp = await fetch(`/api/match/${matchId}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: randomMessage, playerId: actor.id })
+        });
+        
+        const json = await resp.json();
+        if (json.ok) {
+          // 消息发送成功，自动刷新聊天
+          loadChatMessages();
+        }
+      } catch (error) {
+        console.error("AI发送消息失败:", error);
+      }
+    }
+    
+    // 语音功能
+    if (refs.voiceToggle && refs.voicePanel) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const matchId = urlParams.get('matchId');
+      
+      // 语音消息存储
+      const voiceMessagesData = {};
+      let currentAudio = null;
+      let currentAudioId = null;
+      
+      refs.voiceToggle.addEventListener("click", () => {
+        refs.voicePanel.style.display = refs.voicePanel.style.display === "none" ? "block" : "none";
+      });
+      
+      if (refs.voiceClose) {
+        refs.voiceClose.addEventListener("click", () => {
+          refs.voicePanel.style.display = "none";
+        });
+      }
+      
+      if (refs.voiceSend && refs.voiceInput) {
+        const sendVoiceMessage = async () => {
+          const text = refs.voiceInput.value.trim();
+          if (!text || !matchId) return;
+          
+          try {
+            // 文字转语音
+            if ('speechSynthesis' in window) {
+              const utterance = new SpeechSynthesisUtterance(text);
+              utterance.lang = 'zh-CN';
+              utterance.volume = 0.8;
+              speechSynthesis.speak(utterance);
+            }
+            
+            // 发送文本消息到聊天
+            const resp = await fetch(`/api/match/${matchId}/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: text })
+            });
+            const json = await resp.json();
+            if (json.ok) {
+              refs.voiceInput.value = "";
+              // 生成唯一ID
+              const messageId = 'voice_' + Date.now();
+              // 显示语音消息
+              if (refs.voiceMessages) {
+                const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+                const human = getPlayerById(state.humanPlayerId);
+                const playerName = human ? human.name : '玩家';
+                
+                const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">' + playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(251, 191, 36, 0.2); color: #eef6ff; font-size: 13px; word-break: break-all;">' + text + '</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span style="font-size: 10px; color: #fbbf24;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #fbbf24;">0:03</span></div></div>';
+                
+                if (refs.voiceMessages.innerHTML.includes('暂无语音消息')) {
+                  refs.voiceMessages.innerHTML = messageHTML;
+                } else {
+                  refs.voiceMessages.innerHTML += messageHTML;
+                }
+                refs.voiceMessages.scrollTop = refs.voiceMessages.scrollHeight;
+              }
+              
+              // 存储消息数据
+              voiceMessagesData[messageId] = {
+                text: text,
+                timestamp: Date.now(),
+                type: 'text-to-speech'
+              };
+            }
+          } catch (error) {
+            console.error("发送语音消息失败:", error);
+          }
+        };
+        
+        refs.voiceSend.addEventListener("click", sendVoiceMessage);
+        refs.voiceInput.addEventListener("keypress", (e) => {
+          if (e.key === "Enter") sendVoiceMessage();
+        });
+      }
+      
+      // 语音录制功能
+      if (refs.voiceRecord) {
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let startTime = 0;
+        
+        refs.voiceRecord.addEventListener("mousedown", async () => {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            audioChunks = [];
+            startTime = Date.now();
+            
+            mediaRecorder.ondataavailable = (event) => {
+              if (event.data.size > 0) {
+                audioChunks.push(event.data);
+              }
+            };
+            
+            mediaRecorder.onstop = () => {
+              const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+              const duration = Math.round((Date.now() - startTime) / 1000);
+              
+              // 生成唯一ID
+              const messageId = 'voice_' + Date.now();
+              
+              // 显示语音消息
+              if (refs.voiceMessages) {
+                const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+                const human = getPlayerById(state.humanPlayerId);
+                const playerName = human ? human.name : '玩家';
+                
+                const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">' + playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(251, 191, 36, 0.2); color: #eef6ff; font-size: 13px; word-break: break-all;">语音消息</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span class="voice-status" style="font-size: 10px; color: #fbbf24;">▶</span><span style="font-size: 10px; color: #fbbf24;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #fbbf24;">0:' + (duration < 10 ? '0' + duration : duration) + '</span></div></div>';
+                
+                if (refs.voiceMessages.innerHTML.includes('暂无语音消息')) {
+                  refs.voiceMessages.innerHTML = messageHTML;
+                } else {
+                  refs.voiceMessages.innerHTML += messageHTML;
+                }
+                refs.voiceMessages.scrollTop = refs.voiceMessages.scrollHeight;
+              }
+              
+              // 存储消息数据
+              voiceMessagesData[messageId] = {
+                blob: audioBlob,
+                duration: duration,
+                timestamp: Date.now(),
+                type: 'recorded'
+              };
+              
+              console.log('语音录制完成', audioBlob);
+            };
+            
+            mediaRecorder.start();
+            refs.voiceRecord.textContent = "录制中...";
+            refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.3)";
+          } catch (error) {
+            console.error("语音录制失败:", error);
+          }
+        });
+        
+        refs.voiceRecord.addEventListener("mouseup", () => {
+          if (mediaRecorder && mediaRecorder.state === "recording") {
+            mediaRecorder.stop();
+            // 停止所有音频轨道
+            mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            refs.voiceRecord.textContent = "按住说话";
+            refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
+          }
+        });
+        
+        // 处理鼠标移出按钮的情况
+        refs.voiceRecord.addEventListener("mouseleave", () => {
+          if (mediaRecorder && mediaRecorder.state === "recording") {
+            mediaRecorder.stop();
+            mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            refs.voiceRecord.textContent = "按住说话";
+            refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
+          }
+        });
+      }
+      
+      // 语音消息播放功能
+      if (refs.voiceMessages) {
+        refs.voiceMessages.addEventListener("click", function (event) {
+          const voiceMessage = event.target.closest('.voice-message');
+          if (!voiceMessage) return;
+          
+          const messageId = voiceMessage.dataset.voiceId;
+          const messageData = voiceMessagesData[messageId];
+          if (!messageData) return;
+          
+          // 停止当前播放的音频
+          if (currentAudio) {
+            currentAudio.pause();
+            currentAudio.currentTime = 0;
+            if (currentAudioId) {
+              const currentMessage = document.querySelector('[data-voice-id="' + currentAudioId + '"]');
+              if (currentMessage) {
+                const statusElement = currentMessage.querySelector('.voice-status');
+                if (statusElement) {
+                  statusElement.textContent = '▶';
+                }
+              }
+            }
+          }
+          
+          // 如果点击的是当前正在播放的音频，则停止
+          if (currentAudioId === messageId) {
+            currentAudio = null;
+            currentAudioId = null;
+            return;
+          }
+          
+          // 播放新的音频
+          if (messageData.type === 'recorded' && messageData.blob) {
+            currentAudio = new Audio(URL.createObjectURL(messageData.blob));
+          } else if (messageData.type === 'text-to-speech' && messageData.text) {
+            currentAudio = new SpeechSynthesisUtterance(messageData.text);
+            currentAudio.lang = 'zh-CN';
+            currentAudio.volume = 0.8;
+          }
+          
+          if (currentAudio) {
+            currentAudioId = messageId;
+            
+            // 更新播放状态
+            const statusElement = voiceMessage.querySelector('.voice-status');
+            if (statusElement) {
+              statusElement.textContent = '⏸';
+            }
+            
+            // 播放完成处理
+            if (currentAudio instanceof Audio) {
+              currentAudio.onended = function () {
+                if (currentAudioId === messageId) {
+                  const statusElement = voiceMessage.querySelector('.voice-status');
+                  if (statusElement) {
+                    statusElement.textContent = '▶';
+                  }
+                  currentAudio = null;
+                  currentAudioId = null;
+                }
+              };
+              currentAudio.play();
+            } else if (currentAudio instanceof SpeechSynthesisUtterance) {
+              currentAudio.onend = function () {
+                if (currentAudioId === messageId) {
+                  const statusElement = voiceMessage.querySelector('.voice-status');
+                  if (statusElement) {
+                    statusElement.textContent = '▶';
+                  }
+                  currentAudio = null;
+                  currentAudioId = null;
+                }
+              };
+              speechSynthesis.speak(currentAudio);
+            }
+          }
+        });
+      }
+    }
+    
     if (refs.resultRestartBtn) {
       refs.resultRestartBtn.addEventListener("click", () => window.location.reload());
     }
   }
 
-  function initBattle() {
+  async function playHeroVoice(heroName) {
+    try {
+      const response = await fetch(`/hero-voices/${encodeURIComponent(heroName)}.json`);
+      if (!response.ok) return;
+      const voiceLines = await response.json();
+      if (Array.isArray(voiceLines) && voiceLines.length > 0) {
+        const randomLine = voiceLines[Math.floor(Math.random() * voiceLines.length)];
+        // 创建语音合成
+        const utterance = new SpeechSynthesisUtterance(randomLine);
+        utterance.lang = 'zh-CN';
+        utterance.volume = 0.8;
+        speechSynthesis.speak(utterance);
+      }
+    } catch (error) {
+      console.error('播放语音失败:', error);
+    }
+  }
+
+  async function initBattle() {
     state.players = buildPlayers();
     state.drawPile = buildDeck(boot.cards || []);
     state.discardPile = [];
@@ -1209,6 +1935,7 @@
     state.gameOver = null;
     state.rankResultSubmitted = false;
     state.rankUpdate = null;
+    state.battleHistorySaved = false;
 
     state.players.forEach((player) => drawCards(player, 4));
 
@@ -1220,12 +1947,18 @@
     if (modeConfig.key === "slaughter") addLog("杀戮模式生效：摸牌阶段改为 4 张。", "setup");
     addLog("战斗开始。", "setup");
     renderAll();
+
+    // 播放人类玩家的英雄出场语音
+    if (human) {
+      await playHeroVoice(human.hero.name);
+    }
   }
 
   bindEvents();
-  initBattle();
-  runBattleLoop().catch((error) => {
-    console.error(error);
-    refs.hint.textContent = "战斗引擎发生异常，请刷新页面重试。";
+  initBattle().then(() => {
+    runBattleLoop().catch((error) => {
+      console.error(error);
+      refs.hint.textContent = "战斗引擎发生异常，请刷新页面重试。";
+    });
   });
 })();

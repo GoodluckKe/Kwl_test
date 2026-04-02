@@ -7,6 +7,10 @@
   --qb-text: #edf4ff;
   --qb-muted: #9fb0ca;
   --qb-gold: #f5c14f;
+  --qb-seat-size: clamp(92px, 14vmin, 124px);
+  --qb-seat-self-size: clamp(120px, 18vmin, 164px);
+  --qb-seat-avatar-size: clamp(34px, 5.6vmin, 42px);
+  --qb-seat-avatar-self-size: clamp(44px, 7.2vmin, 54px);
 }
 
 * {
@@ -111,7 +115,7 @@ body::before {
 
 .qb-layout {
   display: grid;
-  grid-template-columns: 86px minmax(0, 1fr) 190px;
+  grid-template-columns: 86px minmax(0, 1fr) 240px;
   gap: 10px;
   align-items: stretch;
   min-height: 0;
@@ -316,13 +320,13 @@ body::before {
 
 .qb-seat {
   position: absolute;
-  width: 124px;
+  width: var(--qb-seat-size);
   transform: translate(-50%, -50%);
   cursor: pointer;
 }
 
 .qb-seat.self {
-  width: 164px;
+  width: var(--qb-seat-self-size);
 }
 
 .qb-seat-card {
@@ -379,26 +383,29 @@ body::before {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 42px 1fr;
+  grid-template-columns: var(--qb-seat-avatar-size) 1fr;
   gap: 6px;
 }
 
 .qb-seat.self .qb-seat-head {
-  grid-template-columns: 54px 1fr;
+  grid-template-columns: var(--qb-seat-avatar-self-size) 1fr;
 }
 
 .qb-seat-avatar {
-  width: 42px;
-  height: 42px;
+  width: var(--qb-seat-avatar-size);
+  height: var(--qb-seat-avatar-size);
   border-radius: 12px;
   object-fit: cover;
   border: 1px solid rgba(255, 255, 255, 0.18);
   background: #101826;
+  image-rendering: -webkit-optimize-contrast;
+  transform: translateZ(0);
+  filter: saturate(1.06) contrast(1.04);
 }
 
 .qb-seat.self .qb-seat-avatar {
-  width: 54px;
-  height: 54px;
+  width: var(--qb-seat-avatar-self-size);
+  height: var(--qb-seat-avatar-self-size);
 }
 
 .qb-seat-name {
@@ -417,6 +424,11 @@ body::before {
   margin-top: 4px;
   font-size: 9px;
   font-weight: 800;
+}
+
+.qb-seat-role:not(.role-lord):not(.role-loyalist):not(.role-rebel):not(.role-spy) {
+  color: #666 !important;
+  font-style: italic;
 }
 
 .role-lord {
@@ -565,10 +577,10 @@ body::before {
 .qb-log-panel {
   height: 100%;
   min-height: 0;
-  padding: 10px;
+  padding: 12px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 8px;
+  gap: 10px;
 }
 
 .qb-log-panel h3 {
@@ -614,7 +626,7 @@ body::before {
   }
 
   .qb-log-list {
-    max-height: 180px;
+    max-height: 200px;
   }
 
   .qb-control-panel {
@@ -624,20 +636,22 @@ body::before {
   .qb-actions {
     flex-direction: row;
     flex-wrap: wrap;
+    justify-content: center;
   }
 
   .qb-phase-strip {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 960px) {
   .qb-header {
     grid-template-columns: 1fr;
+    gap: 10px;
   }
 
   .qb-title {
-    text-align: left;
+    text-align: center;
   }
 
   .qb-layout {
@@ -645,24 +659,162 @@ body::before {
   }
 
   .qb-hud-primary {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .qb-phase-strip {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .qb-arena {
-    min-height: 520px;
+    min-height: clamp(300px, 58svh, 520px);
+  }
+
+  .qb-back, .qb-ghost, .qb-primary {
+    height: 36px;
+    font-size: 12px;
+  }
+}
+
+@media (max-height: 760px) {
+  body {
+    height: auto;
+    overflow: auto;
+  }
+
+  .qb-page {
+    height: auto;
+    min-height: 100svh;
+    overflow: visible;
+  }
+
+  .qb-arena {
+    min-height: clamp(280px, 54svh, 420px);
+  }
+
+  .qb-log-list {
+    max-height: 140px;
+  }
+}
+
+@media (orientation: landscape) and (max-height: 560px) {
+  :root {
+    --qb-seat-size: clamp(80px, 16vmin, 98px);
+    --qb-seat-self-size: clamp(104px, 20vmin, 130px);
+    --qb-seat-avatar-size: clamp(30px, 6vmin, 36px);
+    --qb-seat-avatar-self-size: clamp(38px, 7vmin, 44px);
+  }
+
+  .qb-page {
+    padding: 10px 12px 14px;
+  }
+
+  .qb-header {
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .qb-back,
+  .qb-ghost,
+  .qb-primary {
+    height: 34px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .qb-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .qb-hud-primary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .qb-phase-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .qb-arena-panel {
+    padding: 8px;
+  }
+
+  .qb-arena {
+    min-height: clamp(250px, 56svh, 320px);
+  }
+
+  .qb-banner {
+    min-width: 160px;
+    max-width: 74%;
+    font-size: 12px;
+  }
+
+  .qb-seat-name {
+    font-size: 10px;
+  }
+
+  .qb-seat-sub,
+  .qb-seat-role,
+  .qb-seat-stats,
+  .qb-seat-intent {
+    font-size: 8px;
+  }
+
+  .qb-control-panel {
+    grid-template-columns: 1fr;
+    margin-top: 8px;
+  }
+
+  .qb-hint {
+    font-size: 11px;
+  }
+
+  .qb-hand-card {
+    flex-basis: 104px;
+  }
+
+  .qb-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .qb-sidebar {
+    grid-column: 1 / -1;
+    order: 3;
+    height: auto;
+  }
+
+  .qb-log-list {
+    max-height: 120px;
   }
 }
 
 @media (max-width: 640px) {
+  :root {
+    --qb-seat-size: clamp(76px, 24vw, 100px);
+    --qb-seat-self-size: clamp(96px, 28vw, 130px);
+    --qb-seat-avatar-size: clamp(32px, 10vw, 40px);
+    --qb-seat-avatar-self-size: clamp(40px, 12vw, 48px);
+  }
+
   .qb-page {
-    padding: 14px 12px 22px;
+    padding: 12px 10px 20px;
     height: auto;
     min-height: 100svh;
     overflow: auto;
+  }
+
+  .qb-header {
+    gap: 8px;
+  }
+
+  .qb-title {
+    font-size: 18px;
+  }
+
+  .qb-back, .qb-ghost, .qb-primary {
+    height: 34px;
+    padding: 0 10px;
+    font-size: 11px;
   }
 
   .qb-hud-primary {
@@ -673,25 +825,67 @@ body::before {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .qb-seat {
-    width: 132px;
+  .qb-arena {
+    min-height: clamp(260px, 54svh, 480px);
   }
 
-  .qb-seat.self {
-    width: 178px;
+  .qb-banner {
+    font-size: 12px;
+    min-width: 140px;
   }
 
-  .qb-seat-avatar {
-    width: 48px;
-    height: 48px;
+  .qb-seat-name {
+    font-size: 10px;
   }
 
-  .qb-seat.self .qb-seat-avatar {
-    width: 60px;
-    height: 60px;
+  .qb-seat-sub, .qb-seat-role, .qb-seat-stats, .qb-seat-intent {
+    font-size: 8px;
+  }
+
+  .qb-control-panel {
+    margin-top: 8px;
+  }
+
+  .qb-hint {
+    font-size: 11px;
+    padding: 6px 8px;
+  }
+
+  .qb-hand-card {
+    flex-basis: 96px;
+    padding: 4px;
+  }
+
+  .qb-card-name {
+    font-size: 11px;
+  }
+
+  .qb-card-meta {
+    font-size: 9px;
+  }
+
+  .qb-log-panel {
+    padding: 10px;
+  }
+
+  .qb-log-list {
+    max-height: 160px;
+  }
+
+  .qb-log-item {
+    font-size: 10px;
+    padding: 6px 7px;
   }
 
   .qb-result-actions {
     flex-direction: column;
+  }
+
+  .qb-result-card {
+    padding: 20px 16px;
+  }
+
+  .qb-result-card h2 {
+    font-size: 24px;
   }
 }

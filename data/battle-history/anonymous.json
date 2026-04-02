@@ -1,0 +1,11 @@
+[
+  {
+    "result": "lose",
+    "playerName": "Player",
+    "playerHero": "盘古",
+    "opponentName": "AI Opponent",
+    "opponentHero": "AI Hero",
+    "mode": "杀戮模式",
+    "timestamp": 1775037258156
+  }
+]

@@ -2,6 +2,8 @@ import express from "express";
 import dotenv from "dotenv";
 import fs from "fs";
 import crypto from "crypto";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
 
 if (fs.existsSync(".env.local")) {
   dotenv.config({ path: ".env.local" });
@@ -14,21 +16,64 @@ const PORT = Number(process.env.PORT || 3010);
 app.use(express.json());
 app.use(express.static("public"));
 
-const {
-  SECONDME_CLIENT_ID,
-  SECONDME_CLIENT_SECRET,
-  SECONDME_REDIRECT_URI = "http://localhost:3010/api/auth/callback",
-  SECONDME_OAUTH_URL = "https://go.second.me/oauth/",
-  SECONDME_API_BASE_URL = "https://api.mindverse.com/gate/lab",
-  UPSTASH_REDIS_REST_URL = "",
-  UPSTASH_REDIS_REST_TOKEN = "",
-  SESSION_SECRET = "",
-} = process.env;
+const { SECONDME_CLIENT_ID, SECONDME_CLIENT_SECRET, SECONDME_REDIRECT_URI = "http://localhost:3010/api/auth/callback", SECONDME_OAUTH_URL = "https://go.second.me/oauth/", SECONDME_API_BASE_URL = "https://api.mindverse.com/gate/lab", UPSTASH_REDIS_REST_URL = "", UPSTASH_REDIS_REST_TOKEN = "", SESSION_SECRET = "", } = process.env;
+
+import path from "path";
 
 const sessions = new Map();
 const SESSION_TTL_SEC = 60 * 60 * 24 * 30;
 const redisEnabled = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 const SESSION_COOKIE_NAME = "session_data";
+
+// 历史记录存储路径
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+const BATTLE_HISTORY_DIR = path.join(__dirname, 'data', 'battle-history');
+
+// 确保历史记录存储目录存在
+if (!fs.existsSync(BATTLE_HISTORY_DIR)) {
+  fs.mkdirSync(BATTLE_HISTORY_DIR, { recursive: true });
+}
+
+// 数据库文件路径
+const DB_PATH = path.join(BATTLE_HISTORY_DIR, 'battle_history.db');
+
+// 数据库连接
+let db = null;
+
+// 初始化数据库
+async function initDatabase() {
+  try {
+    db = await open({
+      filename: DB_PATH,
+      driver: sqlite3.Database
+    });
+    
+    // 创建历史记录表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS battle_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        result TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        player_hero TEXT NOT NULL,
+        opponent_name TEXT NOT NULL,
+        opponent_hero TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_battle_history_user_id ON battle_history(user_id);
+      CREATE INDEX IF NOT EXISTS idx_battle_history_timestamp ON battle_history(timestamp);
+    `);
+    
+    console.log("数据库初始化成功");
+  } catch (error) {
+    console.error("数据库初始化失败:", error);
+  }
+}
+
+// 初始化数据库
+initDatabase();
 const RANK_PHASES = ["前期", "中期", "后期"];
 const RANK_STEP_EXP = 100;
 const RANK_GAIN_WIN = 20;
@@ -319,7 +364,6 @@ function createAnonymousSession() {
   return {
     user: null,
     token: null,
-    friends: [],
     rankProgress: createRankProgress(),
     createdAt: Date.now(),
   };
@@ -694,6 +738,47 @@ const cardData = [
   },
 ];
 
+const heroArtSvgCache = new Map();
+const cardArtSvgCache = new Map();
+let heroListCache = null;
+let cardListCache = null;
+
+function findHeroById(heroId) {
+  const [factionName, heroName] = String(heroId || "").split("-");
+  if (!factionName || !heroName) return null;
+  const faction = gameData.find((item) => item.faction === factionName);
+  if (!faction) return null;
+  const hero = faction.heroes.find((item) => item.name === heroName);
+  if (!hero) return null;
+  return { faction, hero };
+}
+
+function findCardById(cardId) {
+  const [category, cardName] = String(cardId || "").split("-");
+  if (!category || !cardName) return null;
+  return cardData.find((item) => item.category === category && item.newName === cardName) || null;
+}
+
+function getHeroAvatarSvgById(heroId) {
+  if (!heroId) return "";
+  if (heroArtSvgCache.has(heroId)) return heroArtSvgCache.get(heroId);
+  const found = findHeroById(heroId);
+  if (!found) return "";
+  const svg = buildHeroAvatarSvg(found.hero.name, found.faction.faction, found.hero.title, found.hero.skill);
+  heroArtSvgCache.set(heroId, svg);
+  return svg;
+}
+
+function getCardAvatarSvgById(cardId) {
+  if (!cardId) return "";
+  if (cardArtSvgCache.has(cardId)) return cardArtSvgCache.get(cardId);
+  const card = findCardById(cardId);
+  if (!card) return "";
+  const svg = buildCardAvatarSvg(card.newName, card.category, card.subType, card.effect);
+  cardArtSvgCache.set(cardId, svg);
+  return svg;
+}
+
 function parseCookies(req) {
   const header = req.headers.cookie || "";
   const pairs = header
@@ -717,7 +802,8 @@ function isSecureRequest(req) {
 }
 
 function shouldUseCookieSession(req) {
-  return !redisEnabled && Boolean(process.env.VERCEL || String(req?.headers?.host || "").includes(".vercel.app"));
+  // 在本地开发环境中也使用 cookie 存储会话
+  return !redisEnabled;
 }
 
 function sessionCipherKey() {
@@ -760,6 +846,7 @@ function pickSessionSnapshot(session) {
         }
       : null,
     rankProgress: ensureRankProgress(session || createAnonymousSession()),
+    battleHistory: session?.battleHistory || [],
     createdAt: session?.createdAt || Date.now(),
   };
 }
@@ -783,7 +870,6 @@ function unsealSessionCookie(payload) {
     decipher.setAuthTag(tag);
     const json = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
     const session = JSON.parse(json);
-    if (session && !Array.isArray(session.friends)) session.friends = [];
     if (session) ensureRankProgress(session);
     return session;
   } catch {
@@ -928,7 +1014,6 @@ async function getSessionFromRequest(req) {
   if (sealedSession) {
     const session = unsealSessionCookie(sealedSession);
     if (session) {
-      if (!Array.isArray(session.friends)) session.friends = [];
       ensureRankProgress(session);
       return { cookies, sid: "", session };
     }
@@ -936,7 +1021,6 @@ async function getSessionFromRequest(req) {
   const sid = cookies.sid || "";
   const session = sid ? await getStoredSession(sid) : null;
   if (session) {
-    if (!Array.isArray(session.friends)) session.friends = [];
     ensureRankProgress(session);
   }
   return { cookies, sid, session };
@@ -972,8 +1056,8 @@ function getUserAvatarUrl(user) {
     const candidate = user.avatar || user.avatarUrl || user.headImg || user.headimg || user.image;
     if (candidate) return candidate;
   }
-  const seed = encodeURIComponent(String(user?.nickname || user?.name || user?.id || "secondme-player"));
-  return `https://api.dicebear.com/9.x/fantasy/svg?seed=${seed}&backgroundType=gradientLinear`;
+  // 使用默认头像
+  return "/assets/bg-myth-war.png";
 }
 
 function svgToDataUri(svg) {
@@ -1246,10 +1330,10 @@ function heroPropArt(meta, t) {
   }
 }
 
-function getHeroAvatar(heroName, factionName, title = "", skill = "") {
+function buildHeroAvatarSvg(heroName, factionName, title = "", skill = "") {
   const t = heroVisualTheme(factionName);
   const meta = getHeroArtMeta(heroName, factionName, title, skill);
-  const svg = `
+  return `
   <svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
     <defs>
       <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
@@ -1290,7 +1374,11 @@ function getHeroAvatar(heroName, factionName, title = "", skill = "") {
     <text x="320" y="580" text-anchor="middle" font-size="20" fill="#f8e5bc" fill-opacity="0.9" font-family="PingFang SC, Microsoft YaHei, sans-serif">${meta.posterLine}</text>
     <rect x="22" y="22" width="596" height="596" rx="28" fill="none" stroke="url(#frame)" stroke-width="4"/>
   </svg>`;
-  return svgToDataUri(svg);
+}
+
+function getHeroAvatar(heroName, factionName, title, skill) {
+  // 使用预生成的高质量PNG人物头像
+  return `/hero-images/${heroName}.png`;
 }
 
 function getCardTacticLabel(cardName, effect, category) {
@@ -1404,10 +1492,18 @@ function cardMotif(meta, t) {
   }
 }
 
-function getCardAvatar(cardName, category, subType = "", effect = "") {
+function summarizeCardEffect(effect = "") {
+  const text = String(effect || "").replace(/\s+/g, " ").trim();
+  if (!text) return "战术效果";
+  const first = text.split("；")[0].split("。")[0].split("，").slice(0, 2).join("，");
+  return first.length > 24 ? `${first.slice(0, 24)}…` : first;
+}
+
+function buildCardAvatarSvg(cardName, category, subType = "", effect = "") {
   const t = cardVisualTheme(category, subType);
   const meta = getCardArtMeta(cardName, category, subType, effect);
-  const svg = `
+  const effectSummary = summarizeCardEffect(effect);
+  return `
   <svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
     <defs>
       <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
@@ -1427,13 +1523,19 @@ function getCardAvatar(cardName, category, subType = "", effect = "") {
     <text x="320" y="100" text-anchor="middle" font-size="32" fill="${t.c3}" font-family="PingFang SC, Microsoft YaHei, sans-serif">${category} · ${subType}</text>
     <rect x="88" y="148" width="464" height="300" rx="30" fill="#020617" fill-opacity="0.18" stroke="${t.c3}" stroke-opacity="0.18"/>
     ${cardMotif(meta, t)}
-    <rect x="96" y="472" width="448" height="104" rx="22" fill="#050b16" fill-opacity="0.44" stroke="${t.c3}" stroke-opacity="0.24"/>
+    <rect x="96" y="468" width="448" height="120" rx="22" fill="#050b16" fill-opacity="0.52" stroke="${t.c3}" stroke-opacity="0.26"/>
     <text x="320" y="518" text-anchor="middle" font-size="68" font-weight="800" fill="#fff" font-family="PingFang SC, Microsoft YaHei, sans-serif">${cardName}</text>
     <text x="320" y="548" text-anchor="middle" font-size="24" fill="${t.c3}" font-family="PingFang SC, Microsoft YaHei, sans-serif">${meta.sceneLine}</text>
-    <rect x="252" y="556" width="136" height="42" rx="21" fill="${t.c3}" fill-opacity="0.22" stroke="${t.c3}" stroke-opacity="0.78"/>
-    <text x="320" y="584" text-anchor="middle" font-size="24" fill="#fff" font-family="PingFang SC, Microsoft YaHei, sans-serif">${meta.badge}</text>
+    <text x="320" y="572" text-anchor="middle" font-size="18" fill="#fef6e4" fill-opacity="0.94" font-family="PingFang SC, Microsoft YaHei, sans-serif">${effectSummary}</text>
+    <rect x="252" y="580" width="136" height="34" rx="17" fill="${t.c3}" fill-opacity="0.22" stroke="${t.c3}" stroke-opacity="0.78"/>
+    <text x="320" y="603" text-anchor="middle" font-size="20" fill="#fff" font-family="PingFang SC, Microsoft YaHei, sans-serif">${meta.badge}</text>
   </svg>`;
-  return svgToDataUri(svg);
+}
+
+function getCardAvatar(cardName, category, subType, effect) {
+  // 直接使用SVG数据URL作为头像
+  const svg = buildCardAvatarSvg(cardName, category, subType, effect);
+  return "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64");
 }
 
 function battleSceneArt(meta, t) {
@@ -1628,41 +1730,9 @@ function renderUserInfoPanel(user) {
   `;
 }
 
-function normalizeFriendItem(item, index) {
-  const id = String(item?.id || item?.userId || item?.uid || `friend-${index + 1}`);
-  const name = String(item?.nickname || item?.name || item?.displayName || `好友${index + 1}`);
-  const avatar = String(item?.avatar || item?.avatarUrl || item?.headImg || getUserAvatarUrl({ id, name }));
-  const status = String(item?.status || item?.onlineStatus || "在线");
-  const bio = String(item?.bio || item?.signature || item?.intro || "暂无签名");
-  return { id, name, avatar, status, bio, raw: item || {} };
-}
 
-async function fetchSecondMeFriends(accessToken) {
-  const candidates = [
-    `${SECONDME_API_BASE_URL}/api/secondme/friend/list`,
-    `${SECONDME_API_BASE_URL}/api/secondme/friends/list`,
-    `${SECONDME_API_BASE_URL}/api/secondme/user/friends`,
-  ];
-  for (const url of candidates) {
-    try {
-      const resp = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-      const json = await resp.json().catch(() => null);
-      if (!resp.ok || !json || json.code !== 0) continue;
-      const list = Array.isArray(json.data)
-        ? json.data
-        : Array.isArray(json.data?.list)
-          ? json.data.list
-          : Array.isArray(json.data?.items)
-            ? json.data.items
-            : null;
-      if (!list) continue;
-      return list.map((item, index) => normalizeFriendItem(item, index));
-    } catch {
-      continue;
-    }
-  }
-  return [];
-}
+
+
 
 async function fetchSecondMeUser(accessToken) {
   if (!accessToken) return null;
@@ -1759,6 +1829,21 @@ function getIntegrationTools(baseUrl) {
         properties: {
           heroId: { type: "string", description: "英雄 ID，例如 奥林匹斯-雅典娜。" },
           mode: { type: "string", description: "quick / ranked / slaughter，默认 quick。" },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "emotional_support_chat",
+      description: "提供情绪倾诉、安抚与可执行的心理支持建议。",
+      authRequired: true,
+      route: `${baseUrl}/api/mcp`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "用户当前想表达的情绪或困扰内容。" },
+          mood: { type: "string", description: "可选，情绪标签（如 焦虑/难过/愤怒/疲惫）。" },
+          intensity: { type: "number", description: "可选，情绪强度 0-10。" },
         },
         additionalProperties: false,
       },
@@ -1902,6 +1987,55 @@ async function runIntegrationTool(req, tool, input) {
     };
   }
 
+  if (normalizedTool === "emotional_support_chat") {
+    const message = typeof normalizedInput.message === "string" ? normalizedInput.message.trim() : "";
+    const mood = typeof normalizedInput.mood === "string" ? normalizedInput.mood.trim() : "";
+    const intensityRaw = Number(normalizedInput.intensity);
+    const intensity = Number.isFinite(intensityRaw) ? Math.min(10, Math.max(0, intensityRaw)) : null;
+    const text = `${message} ${mood}`.toLowerCase();
+    const highRiskKeywords = ["自杀", "轻生", "结束生命", "伤害自己", "不想活", "suicide", "kill myself", "self-harm"];
+    const highRisk = highRiskKeywords.some((word) => text.includes(word));
+    const userName = upstreamUser.nickname || upstreamUser.name || upstreamUser.displayName || "你";
+
+    const opening = highRisk
+      ? `${userName}，我听到了你现在非常痛苦，这份感受很重要，你并不需要独自扛着。`
+      : `${userName}，谢谢你愿意把这些说出来，我在认真听。`;
+
+    const reflection = message
+      ? `你刚刚提到：“${message.slice(0, 220)}${message.length > 220 ? "..." : ""}”。`
+      : `如果你愿意，可以再多说一点你最难受的具体场景，我会陪你一起梳理。`;
+
+    const steps = highRisk
+      ? [
+          "先把自己带到更安全、有人在的环境，避免独处和可能伤害自己的物品。",
+          "立刻联系你信任的人，请对方陪在你身边。",
+          "若你有紧急风险，请立即联系当地紧急求助电话或危机干预热线。",
+        ]
+      : [
+          "先做 60 秒缓慢呼吸：吸气 4 秒，呼气 6 秒，连续 6 轮。",
+          "把最困扰你的问题写成一句话，再写下一步可执行的小动作（5 分钟内可做）。",
+          "今晚给自己留一个“恢复窗口”：喝水、简单进食、减少信息刺激、尽量提前休息。",
+        ];
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        tool: normalizedTool,
+        data: {
+          reply: `${opening}${reflection}我们可以先从一件最小、最可控的事开始。`,
+          mood: mood || null,
+          intensity,
+          riskLevel: highRisk ? "high" : "normal",
+          steps,
+          disclaimer: highRisk
+            ? "当前内容涉及高风险信号，建议优先寻求线下即时帮助。"
+            : "以上建议用于情绪支持，不替代专业医疗诊断与治疗。",
+        },
+      },
+    };
+  }
+
   return { status: 404, body: { ok: false, error: "unknown_tool" } };
 }
 
@@ -1936,7 +2070,8 @@ function toMcpToolResult(payload, fallbackText) {
 }
 
 function flattenHeroes() {
-  return gameData.flatMap((faction) =>
+  if (heroListCache) return heroListCache;
+  heroListCache = gameData.flatMap((faction) =>
     faction.heroes.map((hero) => {
       const artMeta = getHeroArtMeta(hero.name, faction.faction, hero.title, hero.skill);
       return {
@@ -1956,10 +2091,12 @@ function flattenHeroes() {
       };
     })
   );
+  return heroListCache;
 }
 
 function flattenCards() {
-  return cardData.map((card) => {
+  if (cardListCache) return cardListCache;
+  cardListCache = cardData.map((card) => {
     const artMeta = getCardArtMeta(card.newName, card.category, card.subType, card.effect);
     return {
       ...card,
@@ -1969,6 +2106,7 @@ function flattenCards() {
       avatar: getCardAvatar(card.newName, card.category, card.subType, card.effect),
     };
   });
+  return cardListCache;
 }
 
 function getBattleModeMeta(mode) {
@@ -1999,7 +2137,7 @@ function getBattleModeMeta(mode) {
   };
 }
 
-function renderPage({ isLoggedIn, user, friends, rankProgress }) {
+function renderPage({ isLoggedIn, user, rankProgress }) {
   const allHeroes = flattenHeroes();
   const allCards = flattenCards();
   const rankMeta = getRankMeta(rankProgress?.score || 0);
@@ -2021,7 +2159,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
     .map(
       (hero) => `
       <button class="hero-card hero-select" data-faction="${hero.faction}" data-hero-id="${hero.id}">
-        <img class="hero-avatar" src="${hero.avatar}" alt="${hero.name}" />
+        <img class="hero-avatar" src="${hero.avatar}" alt="${hero.name}" loading="lazy" decoding="async" />
         <div class="atlas-chip-row">
           <span class="atlas-chip faction">${hero.faction}</span>
           <span class="atlas-chip">${hero.culture}</span>
@@ -2037,7 +2175,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
     .map(
       (card) => `
       <button class="card-tile card-select" data-category="${card.category}" data-card-id="${card.id}">
-        <img class="card-avatar" src="${card.avatar}" alt="${card.newName}" />
+        <img class="card-avatar" src="${card.avatar}" alt="${card.newName}" loading="lazy" decoding="async" />
         <div class="atlas-chip-row">
           <span class="atlas-chip card">${card.category}</span>
           <span class="atlas-chip">${card.badge}</span>
@@ -2051,30 +2189,11 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
     .join("");
   const avatar = isLoggedIn ? getUserAvatarUrl(user) : "";
   const userInfoPanel = isLoggedIn ? renderUserInfoPanel(user) : renderUserInfoPanel(null);
-  const friendList = Array.isArray(friends) && friends.length > 0 ? friends : [];
-  const friendsJson = JSON.stringify(friendList).replaceAll("<", "\\u003c");
-  const friendRows = friendList.length
-    ? friendList
-        .map(
-          (f) => `
-        <div class="friend-item" data-friend-id="${escapeHtml(f.id)}">
-          <button class="friend-avatar-btn" data-friend-id="${escapeHtml(f.id)}">
-            <img src="${escapeHtml(f.avatar)}" alt="${escapeHtml(f.name)}" />
-          </button>
-          <div class="friend-meta">
-            <div class="friend-name">${escapeHtml(f.name)}</div>
-            <div class="friend-status">${escapeHtml(f.status)}</div>
-          </div>
-          <button class="invite-btn" data-friend-id="${escapeHtml(f.id)}">邀请</button>
-        </div>
-      `
-        )
-        .join("")
-    : `<div class="friend-empty">暂无好友数据（仅展示 SecondMe 实时拉取结果）</div>`;
+
   const leftArea = isLoggedIn
     ? `
       <button class="avatar-btn" id="avatarBtn" title="查看个人信息">
-        <img src="${avatar}" alt="avatar" />
+        <img src="${avatar}" alt="avatar" decoding="async" />
       </button>
     `
     : `<div></div>`;
@@ -2220,6 +2339,18 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
           box-shadow:0 0 20px rgba(125,211,252,.35);
         }
         .avatar-btn img{width:100%;height:100%;display:block;object-fit:cover}
+        .avatar-btn img,
+        .friend-avatar-btn img,
+        .hero-avatar,
+        .card-avatar,
+        .battle-pick img,
+        .battle-preview img,
+        .hero-modal-top img,
+        .friend-modal-top img{
+          image-rendering:-webkit-optimize-contrast;
+          transform:translateZ(0);
+          filter:saturate(1.06) contrast(1.04);
+        }
         .ghost-btn,.login-btn{
           display:inline-flex;align-items:center;justify-content:center;
           height:40px;padding:0 14px;border-radius:10px;text-decoration:none;font-weight:700;cursor:pointer;
@@ -2242,7 +2373,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         }
         .hero-drawer.show{display:block}
         .card-drawer{
-          position:fixed;left:12px;top:150px;z-index:15;
+          position:fixed;left:12px;top:150px;z-index:1000;
           width:calc(100vw - 24px);max-height:88vh;overflow:auto;
           border:1px solid rgba(251,191,36,.45);border-radius:18px;padding:18px;
           background:rgba(28,18,8,.94);backdrop-filter: blur(6px);display:none;
@@ -2355,6 +2486,18 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
           border-radius:999px;padding:5px 10px;cursor:pointer;font-size:12px;font-weight:700;
         }
         .friend-empty{font-size:12px;color:#9db4d5;padding:8px}
+        .history-list{display:flex;flex-direction:column;gap:12px}
+        .history-item{border:1px solid rgba(251,191,36,.35);border-radius:14px;padding:12px;background:rgba(31,24,10,.62);color:#eef6ff}
+        .history-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+        .history-date{font-size:12px;color:#9dc0ea}
+        .history-result{font-size:14px;font-weight:800;padding:4px 10px;border-radius:999px}
+        .history-result.win{background:rgba(74,222,128,.2);color:#4ade80;border:1px solid rgba(74,222,128,.4)}
+        .history-result.lose{background:rgba(248,113,113,.2);color:#f87171;border:1px solid rgba(248,113,113,.4)}
+        .history-details{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+        .history-player{display:flex;flex-direction:column;gap:4px}
+        .history-player-name{font-size:14px;font-weight:700}
+        .history-player-hero{font-size:12px;color:#9dc0ea}
+        .history-empty{font-size:14px;color:#9db4d5;padding:20px;text-align:center}
         .panel{
           position:fixed;left:16px;top:84px;width:min(420px, calc(100% - 32px));
           max-height:70vh;overflow:auto;padding:12px;border-radius:12px;
@@ -2501,36 +2644,268 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         .hero-modal-box{
           width:min(720px,100%);max-height:85vh;overflow:auto;border-radius:16px;padding:16px;
           border:1px solid rgba(147,197,253,.55);background:rgba(8,16,30,.95);
+          transition:all 0.3s ease;
         }
         .card-modal-box{
           width:min(760px,100%);max-height:85vh;overflow:auto;border-radius:16px;padding:16px;
           border:1px solid rgba(251,191,36,.55);background:rgba(30,20,8,.96);
+          transition:all 0.3s ease;
         }
-        .hero-modal-top{display:flex;gap:12px;align-items:flex-start}
+        .hero-modal-top{display:flex;gap:12px;align-items:flex-start;transition:all 0.3s ease}
         .hero-modal-top img{
           width:120px;height:120px;border-radius:14px;border:1px solid rgba(186,230,253,.45);background:#08192d;
+          transition:all 0.3s ease;
         }
-        .hero-modal h3{margin:0 0 6px 0;font-size:28px}
-        .hero-modal p{margin:8px 0;color:#d4e9ff;line-height:1.62}
+        .hero-modal h3{margin:0 0 6px 0;font-size:28px;transition:all 0.3s ease}
+        .hero-modal p{margin:8px 0;color:#d4e9ff;line-height:1.62;transition:all 0.3s ease}
+        
+        /* 桌面端响应式调整 */
+        @media (max-width: 1200px) {
+          .hero-modal-box{
+            width:min(640px,100%);
+            padding:14px;
+          }
+          .hero-modal-top img{
+            width:100px;
+            height:100px;
+          }
+          .hero-modal h3{
+            font-size:24px;
+          }
+        }
+        
+        @media (max-width: 1024px) {
+          .hero-modal-box{
+            width:min(560px,100%);
+            padding:12px;
+          }
+          .hero-modal-top img{
+            width:90px;
+            height:90px;
+          }
+          .hero-modal h3{
+            font-size:22px;
+          }
+          .hero-modal p{
+            font-size:14px;
+          }
+        }
+        
+        /* 平板设备响应式调整 */
+        @media (max-width: 768px) {
+          .hero-modal-box{
+            width:min(90vw,500px);
+            max-height:90vh;
+            padding:12px;
+          }
+          .hero-modal-top{
+            flex-direction:column;
+            align-items:center;
+            text-align:center;
+          }
+          .hero-modal-top img{
+            width:min(200px,50vw);
+            height:auto;
+            aspect-ratio:1/1;
+          }
+          .hero-modal h3{
+            font-size:20px;
+            margin-top:12px;
+          }
+          .hero-modal p{
+            font-size:13px;
+          }
+        }
+        
+        /* 卡片模态框响应式调整 */
+        @media (max-width: 1200px) {
+          .card-modal-box{
+            width:min(680px,100%);
+            padding:14px;
+          }
+        }
+        
+        @media (max-width: 1024px) {
+          .card-modal-box{
+            width:min(600px,100%);
+            padding:12px;
+          }
+        }
+        
+        @media (max-width: 768px) {
+          .card-modal-box{
+            width:min(90vw,540px);
+            max-height:90vh;
+            padding:12px;
+          }
+        }
+        
         @media (max-width: 760px){
-          .side-menu{left:10px;top:92px;width:var(--left-col-width)}
-          .hero-drawer{left:8px;top:132px;width:calc(100vw - 16px);max-height:82vh}
-          .card-drawer{left:8px;top:132px;width:calc(100vw - 16px);max-height:82vh}
-          .brand{font-size:42px;letter-spacing:2px}
-          .topbar{align-items:flex-start;flex-direction:column;gap:12px}
-          .topbar{grid-template-columns:1fr}
-          .left-top,.right-top{justify-self:start}
+          body{overflow-y:auto}
+          .side-menu{
+            position:static;
+            width:calc(100% - 24px);
+            margin:10px 12px 0;
+            flex-direction:row;
+            flex-wrap:wrap;
+            gap:10px;
+          }
+          .menu-btn{
+            flex:1 1 160px;
+            min-height:60px;
+            font-size:14px;
+          }
+          .friends-panel{
+            position:static;
+            width:calc(100% - 24px);
+            margin:10px 12px 0;
+            max-height:none;
+            min-height:0;
+          }
+          .hero-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
+          .card-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
+          .voice-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
+          .panel{top:74px;max-height:calc(100svh - 90px)}
+          .brand{font-size:36px;letter-spacing:1.5px;justify-self:center}
+          .topbar{grid-template-columns:1fr;gap:12px;align-items:center;min-height:0}
+          .left-top,.right-top{justify-self:center}
           .shell{padding:16px 12px 44px 12px}
-          .mode-row{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}
+          .mode-row{grid-template-columns:1fr;width:100%;margin:22px auto 20px}
           .mode-btn{font-size:18px;min-height:82px}
-          .hero-grid{grid-template-columns:repeat(auto-fill,minmax(165px,1fr))}
-          .card-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}
-          .friends-panel{left:8px;right:8px;top:auto;bottom:8px;width:auto;max-height:38vh;min-height:180px}
+          .hero-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+          .card-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
+          .hero-modal-top{flex-direction:column}
+          .hero-modal-top img{width:min(200px,100%);height:auto;aspect-ratio:1/1}
           .battle-modal-box{max-height:92vh;grid-template-rows:auto auto minmax(0,1fr) auto}
           .battle-rank-panel{grid-template-columns:1fr}
           .battle-selection-layout{grid-template-columns:1fr}
           .battle-preview{order:-1}
           .battle-modal-actions{flex-direction:column;align-items:stretch}
+        }
+        
+        /* 手机竖屏响应式调整 */
+        @media (max-width: 480px) {
+          .hero-modal{
+            padding:10px;
+          }
+          .hero-modal-box{
+            width:100%;
+            max-height:92vh;
+            padding:10px;
+            border-radius:12px;
+          }
+          .hero-modal-top img{
+            width:min(160px,50vw);
+          }
+          .hero-modal h3{
+            font-size:18px;
+          }
+          .hero-modal p{
+            font-size:12px;
+            line-height:1.5;
+          }
+          .card-modal-box{
+            width:100%;
+            max-height:92vh;
+            padding:10px;
+            border-radius:12px;
+          }
+        }
+        
+        /* 手机横屏响应式调整 */
+        @media (orientation: landscape) and (max-height: 480px) {
+          .hero-modal{
+            padding:8px;
+          }
+          .hero-modal-box{
+            width:min(90vw,600px);
+            max-height:90vh;
+            padding:10px;
+          }
+          .hero-modal-top{
+            flex-direction:row;
+            align-items:flex-start;
+            text-align:left;
+          }
+          .hero-modal-top img{
+            width:80px;
+            height:80px;
+          }
+          .hero-modal h3{
+            font-size:16px;
+            margin-top:0;
+          }
+          .hero-modal p{
+            font-size:12px;
+            line-height:1.4;
+          }
+          .card-modal-box{
+            width:min(90vw,640px);
+            max-height:90vh;
+            padding:10px;
+          }
+        }
+        
+        /* 小屏幕横屏响应式调整 */
+        @media (orientation: landscape) and (max-height: 320px) {
+          .hero-modal-box{
+            width:min(95vw,700px);
+            max-height:95vh;
+            padding:8px;
+          }
+          .hero-modal-top img{
+            width:60px;
+            height:60px;
+          }
+          .hero-modal h3{
+            font-size:14px;
+          }
+          .hero-modal p{
+            font-size:11px;
+          }
+          .card-modal-box{
+            width:min(95vw,740px);
+            max-height:95vh;
+            padding:8px;
+          }
+        }
+        @media (orientation: landscape) and (max-height: 560px){
+          body{overflow-y:auto}
+          .side-menu{
+            position:static;
+            width:calc(100% - 24px);
+            margin:8px 12px 0;
+            flex-direction:row;
+            gap:10px;
+          }
+          .menu-btn{
+            flex:1 1 160px;
+            min-height:50px;
+            font-size:13px;
+            padding:8px 10px;
+          }
+          .friends-panel{
+            position:static;
+            width:calc(100% - 24px);
+            margin:8px 12px 0;
+            max-height:200px;
+            min-height:0;
+          }
+          .voice-drawer{top:74px;max-height:calc(100svh - 84px)}
+          .shell{padding:10px 12px 28px}
+          .topbar{min-height:0;gap:8px}
+          .brand{font-size:30px;letter-spacing:1px}
+          .login-state{margin:6px auto 0;padding:8px 10px}
+          .mode-row{margin:14px auto 16px;gap:10px;grid-template-columns:1fr}
+          .mode-btn{font-size:16px;min-height:66px;padding:12px 10px}
+          .mode-btn-label{font-size:19px}
+          .mode-btn-sub{margin-top:6px;font-size:11px}
+          .hero-drawer{top:74px;max-height:calc(100svh - 84px)}
+          .card-drawer{top:74px;max-height:calc(100svh - 84px)}
+          .filter-row{top:50px}
+          .battle-modal{padding:10px}
+          .battle-modal-box{max-height:96svh;padding:12px;gap:10px}
+          .battle-modal-copy h3{font-size:24px}
         }
       </style>
     </head>
@@ -2538,14 +2913,10 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
       <div class="side-menu">
         <button class="menu-btn" id="heroMenuBtn">英雄介绍</button>
         <button class="menu-btn" id="cardMenuBtn">卡牌图鉴</button>
+        <button class="menu-btn" id="historyMenuBtn">历史战绩</button>
+        <button class="menu-btn" id="voiceMenuBtn">语音聊天</button>
       </div>
-      <aside class="friends-panel">
-        <div class="friends-head">
-          <h4>好友列表</h4>
-          <div class="friends-count">${friendList.length} 人</div>
-        </div>
-        ${friendRows}
-      </aside>
+
 
       <section class="hero-drawer" id="heroDrawer">
         <div class="drawer-head">
@@ -2563,6 +2934,33 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         </div>
         <div class="filter-row">${cardFilters}</div>
         <div class="card-grid">${cardCards}</div>
+      </section>
+
+      <section class="card-drawer" id="historyDrawer">
+        <div class="drawer-head">
+          <div class="drawer-title">历史战绩</div>
+          <button class="close-btn" id="historyDrawerClose">关闭</button>
+        </div>
+        <div class="history-list" id="historyList">
+          <div class="history-empty">暂无历史战绩</div>
+        </div>
+      </section>
+
+      <section class="card-drawer" id="voiceDrawer">
+        <div class="drawer-head">
+          <div class="drawer-title">语音聊天</div>
+          <button class="close-btn" id="voiceDrawerClose">关闭</button>
+        </div>
+        <div id="voiceMessages" style="height: 300px; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px;">
+          <div style="text-align: center; color: #64748b; font-size: 12px;">暂无语音消息</div>
+        </div>
+        <div style="padding: 12px; border-top: 1px solid rgba(125,211,252,.22); display: flex; flex-direction: column; gap: 8px;">
+          <input type="text" id="voiceInput" placeholder="输入文字转语音..." style="flex: 1; padding: 8px; border: 1px solid rgba(125,211,252,.35); border-radius: 999px; background: #0e1b32; color: #d5e9ff; font-size: 14px;">
+          <div style="display: flex; gap: 8px;">
+            <button id="voiceRecord" style="flex: 1; padding: 8px 16px; background: rgba(248, 113, 113, 0.2); border: 1px solid rgba(248, 113, 113, 0.3); border-radius: 999px; color: #f87171; cursor: pointer; font-weight: 700;">按住说话</button>
+            <button id="voiceSend" style="padding: 8px 16px; background: rgba(74,222,128,.2); border: 1px solid rgba(74,222,128,.4); border-radius: 999px; color: #4ade80; cursor: pointer; font-weight: 700;">发送</button>
+          </div>
+        </div>
       </section>
 
       <div class="shell">
@@ -2592,7 +2990,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             <button class="close-btn" id="heroModalClose">关闭</button>
           </div>
           <div class="hero-modal-top">
-            <img id="modalAvatar" src="" alt="hero" />
+            <img id="modalAvatar" src="" alt="hero" decoding="async" />
             <div>
               <h3 id="modalName"></h3>
               <p id="modalBase"></p>
@@ -2611,7 +3009,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             <button class="close-btn" id="cardModalClose">关闭</button>
           </div>
           <div class="hero-modal-top">
-            <img id="cardModalAvatar" src="" alt="card" />
+            <img id="cardModalAvatar" src="" alt="card" decoding="async" />
             <div>
               <h3 id="cardModalName"></h3>
               <p id="cardModalBase"></p>
@@ -2622,22 +3020,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
           <p id="cardModalDesign"></p>
         </div>
       </section>
-      <section class="friend-modal" id="friendModal">
-        <div class="friend-modal-box">
-          <div class="drawer-head">
-            <div class="drawer-title">好友信息</div>
-            <button class="close-btn" id="friendModalClose">关闭</button>
-          </div>
-          <div class="friend-modal-top">
-            <img id="friendAvatar" src="" alt="friend" />
-            <div>
-              <h3 id="friendName"></h3>
-              <p id="friendStatus"></p>
-            </div>
-          </div>
-          <div class="friend-modal-body" id="friendBio"></div>
-        </div>
-      </section>
+
 
       <section class="battle-modal" id="battleModal">
         <div class="battle-modal-box">
@@ -2666,8 +3049,10 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
 
       <script id="heroData" type="application/json">${heroDataJson}</script>
       <script id="cardData" type="application/json">${cardDataJson}</script>
-      <script id="friendsData" type="application/json">${friendsJson}</script>
+
       <script id="rankData" type="application/json">${rankMetaJson}</script>
+
+      <script src="/home-voice.js"></script>
 
       <script>
         const heroMenuBtn = document.getElementById("heroMenuBtn");
@@ -2676,6 +3061,10 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         const cardMenuBtn = document.getElementById("cardMenuBtn");
         const cardDrawer = document.getElementById("cardDrawer");
         const cardDrawerClose = document.getElementById("cardDrawerClose");
+        const historyMenuBtn = document.getElementById("historyMenuBtn");
+        const historyDrawer = document.getElementById("historyDrawer");
+        const historyDrawerClose = document.getElementById("historyDrawerClose");
+        const historyList = document.getElementById("historyList");
         const loginBtn = document.getElementById("loginBtn");
         const avatarBtn = document.getElementById("avatarBtn");
         const panel = document.getElementById("userPanel");
@@ -2683,8 +3072,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         const heroModalClose = document.getElementById("heroModalClose");
         const cardModal = document.getElementById("cardModal");
         const cardModalClose = document.getElementById("cardModalClose");
-        const friendModal = document.getElementById("friendModal");
-        const friendModalClose = document.getElementById("friendModalClose");
+
         const battleModal = document.getElementById("battleModal");
         const battleModalClose = document.getElementById("battleModalClose");
         const battleModeTag = document.getElementById("battleModeTag");
@@ -2699,15 +3087,14 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         const heroCards = Array.from(document.querySelectorAll(".hero-select"));
         const cardCards = Array.from(document.querySelectorAll(".card-select"));
         const modeButtons = Array.from(document.querySelectorAll(".mode-btn"));
-        const friendAvatarButtons = Array.from(document.querySelectorAll(".friend-avatar-btn"));
-        const inviteButtons = Array.from(document.querySelectorAll(".invite-btn"));
+
         const heroData = JSON.parse(document.getElementById("heroData").textContent || "[]");
         const cardData = JSON.parse(document.getElementById("cardData").textContent || "[]");
-        const friendsData = JSON.parse(document.getElementById("friendsData").textContent || "[]");
+
         const rankData = JSON.parse(document.getElementById("rankData").textContent || "{}");
         const heroMap = new Map(heroData.map((h) => [h.id, h]));
         const cardMap = new Map(cardData.map((c) => [c.id, c]));
-        const friendMap = new Map(friendsData.map((f) => [f.id, f]));
+
         const loginState = document.getElementById("loginState");
         const battleModes = {
           quick: {
@@ -2726,6 +3113,11 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             label: "杀戮模式",
             intro: "更强调资源堆叠与连续压制，适合想体验高爆发神战节奏的玩家。",
             path: "/battle/slaughter",
+            ranked: false
+          },
+          manual: {
+            label: "手动匹配",
+            intro: "输入其他SecondMe用户ID进行匹配。",
             ranked: false
           }
         };
@@ -2761,7 +3153,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
           battleHeroList.innerHTML = heroData.map((hero) => {
             const active = hero.id === selectedBattleHeroId ? "active" : "";
             return '<button class="battle-pick ' + active + '" type="button" data-battle-hero="' + hero.id + '">' +
-              '<img src="' + hero.avatar + '" alt="' + hero.name + '" />' +
+              '<img src="' + hero.avatar + '" alt="' + hero.name + '" loading="lazy" decoding="async" />' +
               '<div class="battle-pick-name">' + hero.name + '</div>' +
               '<div class="battle-pick-line">' + hero.faction + ' · ' + hero.title + '</div>' +
               '<div class="battle-pick-line">体力 ' + hero.hp + ' · 技能【' + hero.skill + '】</div>' +
@@ -2777,7 +3169,7 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             return;
           }
           battlePreview.innerHTML =
-            '<img src="' + hero.avatar + '" alt="' + hero.name + '" />' +
+            '<img src="' + hero.avatar + '" alt="' + hero.name + '" decoding="async" />' +
             '<h4>' + hero.name + '</h4>' +
             '<p>' + hero.faction + ' · ' + hero.culture + ' · 体力 ' + hero.hp + '</p>' +
             '<p>技能【' + hero.skill + '】 · 定位：' + hero.role + '</p>' +
@@ -2839,11 +3231,14 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             if (event.target === battleModal) closeBattleModal();
           });
         }
+        
+        let isFromBattleModal = false;
         if (battleOpenAtlas) {
           battleOpenAtlas.addEventListener("click", function () {
             closeBattleModal();
             if (cardDrawer) cardDrawer.classList.remove("show");
             if (heroDrawer) heroDrawer.classList.add("show");
+            isFromBattleModal = true;
           });
         }
 
@@ -2861,12 +3256,260 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
         if (cardMenuBtn && cardDrawer) {
           cardMenuBtn.addEventListener("click", function () {
             if (heroDrawer) heroDrawer.classList.remove("show");
+            if (historyDrawer) historyDrawer.classList.remove("show");
             cardDrawer.classList.toggle("show");
           });
         }
         if (cardDrawerClose && cardDrawer) {
           cardDrawerClose.addEventListener("click", function () {
             cardDrawer.classList.remove("show");
+          });
+        }
+
+        if (historyMenuBtn && historyDrawer) {
+          historyMenuBtn.addEventListener("click", function () {
+            if (heroDrawer) heroDrawer.classList.remove("show");
+            if (cardDrawer) cardDrawer.classList.remove("show");
+            if (voiceDrawer) voiceDrawer.classList.remove("show");
+            loadHistory();
+            historyDrawer.classList.toggle("show");
+          });
+        }
+        if (historyDrawerClose && historyDrawer) {
+          historyDrawerClose.addEventListener("click", function () {
+            historyDrawer.classList.remove("show");
+          });
+        }
+
+        const voiceMenuBtn = document.getElementById("voiceMenuBtn");
+        const voiceDrawer = document.getElementById("voiceDrawer");
+        const voiceDrawerClose = document.getElementById("voiceDrawerClose");
+        const voiceMessages = document.getElementById("voiceMessages");
+        const voiceInput = document.getElementById("voiceInput");
+        const voiceRecord = document.getElementById("voiceRecord");
+        const voiceSend = document.getElementById("voiceSend");
+
+        if (voiceMenuBtn && voiceDrawer) {
+          voiceMenuBtn.addEventListener("click", function () {
+            if (heroDrawer) heroDrawer.classList.remove("show");
+            if (cardDrawer) cardDrawer.classList.remove("show");
+            if (historyDrawer) historyDrawer.classList.remove("show");
+            voiceDrawer.classList.toggle("show");
+          });
+        }
+        if (voiceDrawerClose && voiceDrawer) {
+          voiceDrawerClose.addEventListener("click", function () {
+            voiceDrawer.classList.remove("show");
+          });
+        }
+
+        // 语音消息存储
+        const voiceMessagesData = {};
+        let currentAudio = null;
+        let currentAudioId = null;
+
+        if (voiceSend && voiceInput) {
+          voiceSend.addEventListener("click", function () {
+            const text = voiceInput.value.trim();
+            if (!text) return;
+            
+            // 文字转语音
+            if ('speechSynthesis' in window) {
+              const utterance = new SpeechSynthesisUtterance(text);
+              utterance.lang = 'zh-CN';
+              utterance.volume = 0.8;
+              speechSynthesis.speak(utterance);
+            }
+            
+            // 生成唯一ID
+            const messageId = 'voice_' + Date.now();
+            
+            // 显示语音消息
+            if (voiceMessages) {
+              const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+              const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">我 ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(74,222,128,.2); color: #4ade80; font-size: 13px; word-break: break-all;">' + text + '</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span style="font-size: 10px; color: #4ade80;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #4ade80;">0:03</span></div></div>';
+              
+              if (voiceMessages.innerHTML.includes('暂无语音消息')) {
+                voiceMessages.innerHTML = messageHTML;
+              } else {
+                voiceMessages.innerHTML += messageHTML;
+              }
+              voiceMessages.scrollTop = voiceMessages.scrollHeight;
+            }
+            
+            // 存储消息数据
+            voiceMessagesData[messageId] = {
+              text: text,
+              timestamp: Date.now(),
+              type: 'text-to-speech'
+            };
+            
+            voiceInput.value = "";
+          });
+          
+          voiceInput.addEventListener("keypress", function (e) {
+            if (e.key === "Enter") {
+              voiceSend.click();
+            }
+          });
+        }
+
+        // 语音录制功能
+        if (voiceRecord) {
+          let mediaRecorder = null;
+          let audioChunks = [];
+          let startTime = 0;
+          
+          voiceRecord.addEventListener("mousedown", async function () {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              mediaRecorder = new MediaRecorder(stream);
+              audioChunks = [];
+              startTime = Date.now();
+              
+              mediaRecorder.ondataavailable = function (event) {
+                if (event.data.size > 0) {
+                  audioChunks.push(event.data);
+                }
+              };
+              
+              mediaRecorder.onstop = function () {
+                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                const duration = Math.round((Date.now() - startTime) / 1000);
+                
+                // 生成唯一ID
+                const messageId = 'voice_' + Date.now();
+                
+                // 显示语音消息
+                if (voiceMessages) {
+                  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+                  const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">我 ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(74,222,128,.2); color: #4ade80; font-size: 13px; word-break: break-all;">语音消息</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span class="voice-status" style="font-size: 10px; color: #4ade80;">▶</span><span style="font-size: 10px; color: #4ade80;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #4ade80;">0:' + (duration < 10 ? '0' + duration : duration) + '</span></div></div>';
+                  
+                  if (voiceMessages.innerHTML.includes('暂无语音消息')) {
+                    voiceMessages.innerHTML = messageHTML;
+                  } else {
+                    voiceMessages.innerHTML += messageHTML;
+                  }
+                  voiceMessages.scrollTop = voiceMessages.scrollHeight;
+                }
+                
+                // 存储消息数据
+                voiceMessagesData[messageId] = {
+                  blob: audioBlob,
+                  duration: duration,
+                  timestamp: Date.now(),
+                  type: 'recorded'
+                };
+                
+                console.log('语音录制完成', audioBlob);
+              };
+              
+              mediaRecorder.start();
+              voiceRecord.textContent = "录制中...";
+              voiceRecord.style.background = "rgba(248, 113, 113, 0.3)";
+            } catch (error) {
+              console.error("语音录制失败:", error);
+            }
+          });
+          
+          voiceRecord.addEventListener("mouseup", function () {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+              mediaRecorder.stop();
+              // 停止所有音频轨道
+              mediaRecorder.stream.getTracks().forEach(track => track.stop());
+              voiceRecord.textContent = "按住说话";
+              voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
+            }
+          });
+          
+          // 处理鼠标移出按钮的情况
+          voiceRecord.addEventListener("mouseleave", function () {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+              mediaRecorder.stop();
+              mediaRecorder.stream.getTracks().forEach(track => track.stop());
+              voiceRecord.textContent = "按住说话";
+              voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
+            }
+          });
+        }
+
+        // 语音消息播放功能
+        if (voiceMessages) {
+          voiceMessages.addEventListener("click", function (event) {
+            const voiceMessage = event.target.closest('.voice-message');
+            if (!voiceMessage) return;
+            
+            const messageId = voiceMessage.dataset.voiceId;
+            const messageData = voiceMessagesData[messageId];
+            if (!messageData) return;
+            
+            // 停止当前播放的音频
+            if (currentAudio) {
+              currentAudio.pause();
+              currentAudio.currentTime = 0;
+              if (currentAudioId) {
+                const currentMessage = document.querySelector('[data-voice-id="' + currentAudioId + '"]');
+                if (currentMessage) {
+                  const statusElement = currentMessage.querySelector('.voice-status');
+                  if (statusElement) {
+                    statusElement.textContent = '▶';
+                  }
+                }
+              }
+            }
+            
+            // 如果点击的是当前正在播放的音频，则停止
+            if (currentAudioId === messageId) {
+              currentAudio = null;
+              currentAudioId = null;
+              return;
+            }
+            
+            // 播放新的音频
+            if (messageData.type === 'recorded' && messageData.blob) {
+              currentAudio = new Audio(URL.createObjectURL(messageData.blob));
+            } else if (messageData.type === 'text-to-speech' && messageData.text) {
+              currentAudio = new SpeechSynthesisUtterance(messageData.text);
+              currentAudio.lang = 'zh-CN';
+              currentAudio.volume = 0.8;
+            }
+            
+            if (currentAudio) {
+              currentAudioId = messageId;
+              
+              // 更新播放状态
+              const statusElement = voiceMessage.querySelector('.voice-status');
+              if (statusElement) {
+                statusElement.textContent = '⏸';
+              }
+              
+              // 播放完成处理
+              if (currentAudio instanceof Audio) {
+                currentAudio.onended = function () {
+                  if (currentAudioId === messageId) {
+                    const statusElement = voiceMessage.querySelector('.voice-status');
+                    if (statusElement) {
+                      statusElement.textContent = '▶';
+                    }
+                    currentAudio = null;
+                    currentAudioId = null;
+                  }
+                };
+                currentAudio.play();
+              } else if (currentAudio instanceof SpeechSynthesisUtterance) {
+                currentAudio.onend = function () {
+                  if (currentAudioId === messageId) {
+                    const statusElement = voiceMessage.querySelector('.voice-status');
+                    if (statusElement) {
+                      statusElement.textContent = '▶';
+                    }
+                    currentAudio = null;
+                    currentAudioId = null;
+                  }
+                };
+                speechSynthesis.speak(currentAudio);
+              }
+            }
           });
         }
 
@@ -2893,16 +3536,26 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
 
         heroCards.forEach((card) => {
           card.addEventListener("click", function () {
-            const hero = heroMap.get(card.dataset.heroId);
-            if (!hero || !heroModal) return;
-            document.getElementById("modalAvatar").src = hero.avatar;
-            document.getElementById("modalName").textContent = hero.name;
-            document.getElementById("modalBase").textContent = hero.faction + " | " + hero.culture + " | " + hero.title + " | 体力 " + hero.hp;
-            document.getElementById("modalSkill").textContent = "技能【" + hero.skill + "】 | 定位：" + hero.role;
-            document.getElementById("modalIntro").textContent = "人物介绍：" + hero.intro;
-            document.getElementById("modalTrait").textContent =
-              "阵营特性【" + hero.factionTrait + "】：" + hero.factionTraitDesc + " | 视觉原型：" + hero.posterLine;
-            heroModal.classList.add("show");
+            const heroId = card.dataset.heroId;
+            const hero = heroMap.get(heroId);
+            if (!hero) return;
+            // 检查是否从战斗模态框打开的英雄图鉴
+            if (isFromBattleModal) {
+              // 如果是从战斗模态框打开的英雄图鉴，选择英雄并返回战斗模态框
+              selectedBattleHeroId = heroId;
+              if (heroDrawer) heroDrawer.classList.remove("show");
+              openBattleModal(pendingBattleMode);
+              isFromBattleModal = false;
+            } else if (heroModal) {
+              document.getElementById("modalAvatar").src = hero.avatar;
+              document.getElementById("modalName").textContent = hero.name;
+              document.getElementById("modalBase").textContent = hero.faction + " | " + hero.culture + " | " + hero.title + " | 体力 " + hero.hp;
+              document.getElementById("modalSkill").textContent = "技能【" + hero.skill + "】 | 定位：" + hero.role;
+              document.getElementById("modalIntro").textContent = "人物介绍：" + hero.intro;
+              document.getElementById("modalTrait").textContent =
+                "阵营特性【" + hero.factionTrait + "】：" + hero.factionTraitDesc + " | 视觉原型：" + hero.posterLine;
+              heroModal.classList.add("show");
+            }
           });
         });
         cardCards.forEach((item) => {
@@ -2937,62 +3590,8 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
           });
         }
 
-        friendAvatarButtons.forEach((btn) => {
-          btn.addEventListener("click", function () {
-            const friend = friendMap.get(btn.dataset.friendId);
-            if (!friend || !friendModal) return;
-            document.getElementById("friendAvatar").src = friend.avatar;
-            document.getElementById("friendName").textContent = friend.name;
-            document.getElementById("friendStatus").textContent = "状态：" + friend.status;
-            document.getElementById("friendBio").textContent = friend.bio || "这位好友暂时没有填写简介。";
-            friendModal.classList.add("show");
-          });
-        });
-        if (friendModalClose && friendModal) {
-          friendModalClose.addEventListener("click", function () {
-            friendModal.classList.remove("show");
-          });
-          friendModal.addEventListener("click", function (event) {
-            if (event.target === friendModal) friendModal.classList.remove("show");
-          });
-        }
 
-        inviteButtons.forEach((btn) => {
-          btn.addEventListener("click", async function () {
-            const friendId = btn.dataset.friendId;
-            const friend = friendMap.get(friendId);
-            btn.disabled = true;
-            const originalText = btn.textContent;
-            btn.textContent = "邀请中...";
-            try {
-              const resp = await fetch("/api/friends/invite", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ friendId }),
-              });
-              const json = await resp.json();
-              if (resp.ok && json.ok) {
-                btn.textContent = "已邀请";
-                window.setTimeout(() => {
-                  btn.textContent = originalText;
-                  btn.disabled = false;
-                }, 1200);
-              } else {
-                btn.textContent = "邀请失败";
-                window.setTimeout(() => {
-                  btn.textContent = originalText;
-                  btn.disabled = false;
-                }, 1200);
-              }
-            } catch {
-              btn.textContent = "邀请失败";
-              window.setTimeout(() => {
-                btn.textContent = originalText;
-                btn.disabled = false;
-              }, 1200);
-            }
-          });
-        });
+
 
         if (avatarBtn && panel) {
           avatarBtn.addEventListener("click", function () {
@@ -3003,6 +3602,41 @@ function renderPage({ isLoggedIn, user, friends, rankProgress }) {
             if (panel.contains(e.target) || avatarBtn.contains(e.target)) return;
             panel.classList.remove("show");
           });
+        }
+
+        async function loadHistory() {
+          if (!historyList) return;
+          try {
+            const resp = await fetch("/api/battle/history");
+            const json = await resp.json();
+            if (json.ok && Array.isArray(json.data)) {
+              if (json.data.length === 0) {
+                historyList.innerHTML = '<div class="history-empty">暂无历史战绩</div>';
+                return;
+              }
+              historyList.innerHTML = json.data.map(item => '<div class="history-item">' +
+                '<div class="history-header">' +
+                  '<span class="history-date">' + new Date(item.timestamp).toLocaleString() + '</span>' +
+                  '<span class="history-result ' + (item.result === 'win' ? 'win' : 'lose') + '">' + (item.result === 'win' ? '胜利' : '失败') + '</span>' +
+                '</div>' +
+                '<div class="history-details">' +
+                  '<div class="history-player">' +
+                    '<span class="history-player-name">' + item.playerName + '</span>' +
+                    '<span class="history-player-hero">英雄：' + item.playerHero + '</span>' +
+                  '</div>' +
+                  '<div class="history-player">' +
+                    '<span class="history-player-name">' + item.opponentName + '</span>' +
+                    '<span class="history-player-hero">英雄：' + item.opponentHero + '</span>' +
+                  '</div>' +
+                '</div>' +
+              '</div>').join('');
+            } else {
+              historyList.innerHTML = '<div class="history-empty">加载战绩失败</div>';
+            }
+          } catch (error) {
+            console.error("加载战绩失败:", error);
+            historyList.innerHTML = '<div class="history-empty">加载战绩失败</div>';
+          }
         }
       </script>
     </body>
@@ -3019,7 +3653,7 @@ function renderTutorialPage({ user, rankProgress }) {
     .map(
       (hero) => `
         <article class="guide-hero-card">
-          <img src="${hero.avatar}" alt="${escapeHtml(hero.name)}" />
+          <img src="${hero.avatar}" alt="${escapeHtml(hero.name)}" loading="lazy" decoding="async" />
           <div>
             <h3>${escapeHtml(hero.name)}</h3>
             <p>${escapeHtml(hero.faction)} · ${escapeHtml(hero.title)}</p>
@@ -3033,7 +3667,7 @@ function renderTutorialPage({ user, rankProgress }) {
     .map(
       (card) => `
         <article class="guide-card-card">
-          <img src="${card.avatar}" alt="${escapeHtml(card.newName)}" />
+          <img src="${card.avatar}" alt="${escapeHtml(card.newName)}" loading="lazy" decoding="async" />
           <div>
             <h3>${escapeHtml(card.newName)}</h3>
             <p>${escapeHtml(card.category)} · ${escapeHtml(card.subType)}</p>
@@ -3059,7 +3693,7 @@ function renderTutorialPage({ user, rankProgress }) {
     <body style="--guide-bg:url('${heroBackdrop}')">
       <div class="guide-shell">
         <header class="guide-topbar">
-          <a class="guide-link ghost" href="/">返回大厅</a>
+          <a class="guide-link ghost" href="/game">返回大厅</a>
           <div class="guide-brand">新手教学</div>
           <div class="guide-actions">${loginAction}</div>
         </header>
@@ -3281,11 +3915,327 @@ function renderTutorialPage({ user, rankProgress }) {
               </article>
             </div>
             <div class="guide-cta">
-              <a class="guide-link primary" href="/">返回大厅开始实战</a>
+              <a class="guide-link primary" href="/game">返回大厅开始实战</a>
             </div>
           </section>
         </main>
       </div>
+    </body>
+  </html>`;
+}
+
+function renderEmotionArkPage({ user }) {
+  const isLoggedIn = Boolean(user);
+  const viewerName = user ? user.nickname || user.name || user.displayName || "SecondMe 用户" : "访客";
+  const authAction = isLoggedIn
+    ? `<a class="ark-link" href="/logout">退出登录</a>`
+    : `<a class="ark-link primary" href="/login">SecondMe 登录</a>`;
+  const bootJson = JSON.stringify({
+    loggedIn: isLoggedIn,
+    viewerName,
+  }).replaceAll("<", "\\u003c");
+
+  return `<!doctype html>
+  <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>情感方舟</title>
+      <style>
+        :root {
+          --ark-bg: #f6f8f4;
+          --ark-card: #ffffff;
+          --ark-text: #1f2c24;
+          --ark-muted: #66776d;
+          --ark-primary: #1f8f6a;
+          --ark-primary-strong: #166f52;
+          --ark-line: #dbe5dd;
+          --ark-soft: #ecf5ef;
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+          color: var(--ark-text);
+          background:
+            radial-gradient(1200px 500px at 90% -10%, #d9f0e4 0%, transparent 65%),
+            radial-gradient(900px 400px at -10% 10%, #e6efe7 0%, transparent 60%),
+            var(--ark-bg);
+          min-height: 100vh;
+        }
+        .ark-wrap {
+          max-width: 1080px;
+          margin: 0 auto;
+          padding: 20px;
+        }
+        .ark-topbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 18px;
+        }
+        .ark-brand {
+          font-size: 24px;
+          font-weight: 700;
+          letter-spacing: 0.5px;
+        }
+        .ark-links {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .ark-link {
+          text-decoration: none;
+          color: var(--ark-text);
+          border: 1px solid var(--ark-line);
+          background: #fff;
+          padding: 8px 14px;
+          border-radius: 999px;
+          font-size: 13px;
+          font-weight: 600;
+        }
+        .ark-link.primary {
+          border-color: var(--ark-primary);
+          background: var(--ark-primary);
+          color: #fff;
+        }
+        .ark-grid {
+          display: grid;
+          gap: 16px;
+          grid-template-columns: 1fr 1.35fr;
+        }
+        .ark-card {
+          background: var(--ark-card);
+          border: 1px solid var(--ark-line);
+          border-radius: 18px;
+          padding: 18px;
+          box-shadow: 0 14px 36px rgba(31, 44, 36, 0.08);
+        }
+        .ark-title {
+          margin: 0;
+          font-size: 30px;
+          line-height: 1.2;
+        }
+        .ark-subtitle {
+          margin: 10px 0 0;
+          color: var(--ark-muted);
+          line-height: 1.7;
+        }
+        .ark-pill {
+          display: inline-flex;
+          margin-top: 14px;
+          padding: 6px 12px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 700;
+          background: var(--ark-soft);
+          color: var(--ark-primary-strong);
+        }
+        .ark-log {
+          background: #fcfefd;
+          border: 1px solid var(--ark-line);
+          border-radius: 14px;
+          padding: 14px;
+          min-height: 360px;
+          max-height: 56vh;
+          overflow: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+        .ark-msg {
+          max-width: 92%;
+          padding: 10px 12px;
+          border-radius: 12px;
+          line-height: 1.6;
+          white-space: pre-wrap;
+          word-break: break-word;
+          font-size: 14px;
+        }
+        .ark-msg.user {
+          align-self: flex-end;
+          background: #e6f6ef;
+          border: 1px solid #c7e9db;
+        }
+        .ark-msg.assistant {
+          align-self: flex-start;
+          background: #f5f8f6;
+          border: 1px solid #dfe9e2;
+        }
+        .ark-composer {
+          margin-top: 12px;
+          display: grid;
+          gap: 10px;
+        }
+        .ark-row {
+          display: grid;
+          grid-template-columns: 1fr 130px 120px;
+          gap: 10px;
+        }
+        .ark-input, .ark-select, .ark-number {
+          border: 1px solid var(--ark-line);
+          border-radius: 10px;
+          padding: 10px 12px;
+          font-size: 14px;
+          background: #fff;
+        }
+        .ark-input:focus, .ark-select:focus, .ark-number:focus {
+          outline: none;
+          border-color: #96cbb6;
+          box-shadow: 0 0 0 3px rgba(31, 143, 106, 0.13);
+        }
+        .ark-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+        }
+        .ark-btn {
+          border: none;
+          border-radius: 10px;
+          padding: 10px 14px;
+          font-size: 14px;
+          font-weight: 700;
+          cursor: pointer;
+          background: var(--ark-primary);
+          color: #fff;
+        }
+        .ark-btn[disabled] {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+        .ark-tip {
+          margin-top: 8px;
+          color: var(--ark-muted);
+          font-size: 12px;
+          line-height: 1.6;
+        }
+        @media (max-width: 980px) {
+          .ark-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+          .ark-wrap { padding: 14px; }
+          .ark-row { grid-template-columns: 1fr; }
+          .ark-title { font-size: 24px; }
+          .ark-topbar { align-items: flex-start; flex-direction: column; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="ark-wrap">
+        <header class="ark-topbar">
+          <div class="ark-brand">情感方舟</div>
+          <div class="ark-links">
+            <a class="ark-link" href="/game">神迹对决</a>
+            <a class="ark-link" href="/tutorial">新手教学</a>
+            ${authAction}
+          </div>
+        </header>
+        <main class="ark-grid">
+          <section class="ark-card">
+            <h1 class="ark-title">把情绪先说出来，剩下的我们一起拆解。</h1>
+            <p class="ark-subtitle">这里不是评判场，也不要求你立刻“变好”。你可以从一句最真实的话开始，我会先共情，再给可执行的小步骤。支持焦虑、难过、愤怒、失眠、人际压力等场景。</p>
+            <div class="ark-pill">当前身份：${escapeHtml(viewerName)}</div>
+            <p class="ark-tip">说明：该页面调用本地 <code>emotional_support_chat</code> 工具；如涉及紧急风险，请优先联系身边可信任的人和当地紧急援助渠道。</p>
+          </section>
+          <section class="ark-card">
+            <div class="ark-log" id="arkLog"></div>
+            <form class="ark-composer" id="arkForm">
+              <div class="ark-row">
+                <input id="arkMessage" class="ark-input" placeholder="比如：最近一直睡不着，白天上班很焦虑..." maxlength="2000" required />
+                <select id="arkMood" class="ark-select">
+                  <option value="">情绪标签（可选）</option>
+                  <option value="焦虑">焦虑</option>
+                  <option value="难过">难过</option>
+                  <option value="愤怒">愤怒</option>
+                  <option value="疲惫">疲惫</option>
+                  <option value="迷茫">迷茫</option>
+                </select>
+                <input id="arkIntensity" class="ark-number" type="number" min="0" max="10" step="1" placeholder="强度 0-10" />
+              </div>
+              <div class="ark-actions">
+                <button id="arkSend" type="submit" class="ark-btn">发送</button>
+              </div>
+            </form>
+          </section>
+        </main>
+      </div>
+      <script>
+        window.EMOTION_BOOT = ${bootJson};
+        (function () {
+          const boot = window.EMOTION_BOOT || {};
+          const form = document.getElementById("arkForm");
+          const log = document.getElementById("arkLog");
+          const messageInput = document.getElementById("arkMessage");
+          const moodInput = document.getElementById("arkMood");
+          const intensityInput = document.getElementById("arkIntensity");
+          const sendBtn = document.getElementById("arkSend");
+
+          function append(role, text) {
+            const node = document.createElement("article");
+            node.className = "ark-msg " + role;
+            node.textContent = text;
+            log.appendChild(node);
+            log.scrollTop = log.scrollHeight;
+          }
+
+          append("assistant", "你好，我是情感方舟。你可以先说一句你现在最难受的地方。");
+          if (!boot.loggedIn) {
+            append("assistant", "你还未登录 SecondMe，先点右上角“SecondMe 登录”，登录后我就能结合你的身份继续支持你。");
+          } else {
+            append("assistant", "欢迎回来，" + (boot.viewerName || "你") + "。我们从当下这一个困扰开始。");
+          }
+
+          form.addEventListener("submit", async function (event) {
+            event.preventDefault();
+            const text = String(messageInput.value || "").trim();
+            if (!text) return;
+
+            append("user", text);
+            messageInput.value = "";
+            sendBtn.disabled = true;
+            sendBtn.textContent = "处理中...";
+
+            try {
+              const payload = { message: text };
+              const mood = String(moodInput.value || "").trim();
+              const intensity = Number(intensityInput.value);
+              if (mood) payload.mood = mood;
+              if (Number.isFinite(intensity)) payload.intensity = intensity;
+
+              const response = await fetch("/api/emotion/support", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+              });
+              const json = await response.json().catch(function () { return {}; });
+              if (!response.ok || !json.ok) {
+                const err = json.error || "请求失败，请先确认登录状态。";
+                append("assistant", "暂时无法处理： " + err);
+                return;
+              }
+
+              const data = json.data || {};
+              let answer = String(data.reply || "我在这里听你说。");
+              if (Array.isArray(data.steps) && data.steps.length) {
+                answer += "\\n\\n你现在可以先做：\\n" + data.steps.map(function (item, index) {
+                  return (index + 1) + ". " + item;
+                }).join("\\n");
+              }
+              if (data.disclaimer) {
+                answer += "\\n\\n提示：" + data.disclaimer;
+              }
+              append("assistant", answer);
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error);
+              append("assistant", "网络异常：" + msg);
+            } finally {
+              sendBtn.disabled = false;
+              sendBtn.textContent = "发送";
+            }
+          });
+        })();
+      </script>
     </body>
   </html>`;
 }
@@ -3309,6 +4259,16 @@ function renderQuickBattlePage(user, options = {}) {
     design: card.design,
     range: card.range || null,
   }));
+  
+  // 获取匹配中的玩家信息
+  let matchedPlayers = [];
+  if (options.matchId) {
+    const match = activeMatches.get(options.matchId);
+    if (match && match.players) {
+      matchedPlayers = match.players;
+    }
+  }
+  
   const battleBoot = {
     viewer: user
       ? {
@@ -3325,6 +4285,7 @@ function renderQuickBattlePage(user, options = {}) {
     selectedHeroId,
     heroes: battleHeroes,
     cards: battleCards,
+    matchedPlayers: matchedPlayers,
   };
   const bootJson = JSON.stringify(battleBoot).replaceAll("<", "\\u003c");
 
@@ -3339,12 +4300,48 @@ function renderQuickBattlePage(user, options = {}) {
     <body style="--qb-battle-bg:url('${battleBackground}')">
       <div class="qb-page">
         <header class="qb-header">
-          <a class="qb-back" href="/">返回大厅</a>
+          <a class="qb-back" href="/game">返回大厅</a>
           <div class="qb-title"></div>
-          <div class="qb-footer-actions" style="justify-content:flex-end;">
-            <button class="qb-ghost" id="qbRestart" type="button">重新开局</button>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div id="qbTurnTimer" style="display: none; min-width: 36px; height: 36px; padding: 0 10px; background: rgba(251, 191, 36, 0.15); border: 1px solid rgba(251, 191, 36, 0.4); border-radius: 18px; color: #fbbf24; font-size: 16px; font-weight: bold; line-height: 34px; text-align: center;">20</div>
+            <div class="qb-footer-actions" style="justify-content:flex-end;">
+              <button class="qb-ghost" id="qbRestart" type="button">重新开局</button>
+              <button class="qb-ghost" id="qbChatToggle" type="button">聊天</button>
+              <button class="qb-ghost" id="qbVoiceToggle" type="button">语音</button>
+            </div>
           </div>
         </header>
+
+        <div class="qb-chat-panel" id="qbChatPanel" style="display: none; position: fixed; bottom: 80px; right: 20px; width: 300px; max-height: 400px; background: rgba(15, 23, 42, 0.95); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 12px; z-index: 1000; overflow: hidden;">
+          <div style="padding: 12px; border-bottom: 1px solid rgba(251, 191, 36, 0.2); display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: #fbbf24; font-weight: bold;">游戏聊天</span>
+            <button id="qbChatClose" style="background: none; border: none; color: #9dc0ea; cursor: pointer; font-size: 18px;">×</button>
+          </div>
+          <div id="qbChatMessages" style="height: 280px; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px;">
+            <div style="text-align: center; color: #64748b; font-size: 12px;">暂无消息</div>
+          </div>
+          <div style="padding: 12px; border-top: 1px solid rgba(251, 191, 36, 0.2); display: flex; gap: 8px;">
+            <input type="text" id="qbChatInput" placeholder="发送消息..." style="flex: 1; padding: 8px; border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 6px; background: rgba(31, 24, 10, 0.62); color: #eef6ff; font-size: 14px;">
+            <button id="qbChatSend" style="padding: 8px 16px; background: rgba(251, 191, 36, 0.2); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 6px; color: #fbbf24; cursor: pointer;">发送</button>
+          </div>
+        </div>
+
+        <div class="qb-voice-panel" id="qbVoicePanel" style="display: none; position: fixed; bottom: 80px; right: 20px; width: 300px; max-height: 400px; background: rgba(15, 23, 42, 0.95); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 12px; z-index: 1000; overflow: hidden;">
+          <div style="padding: 12px; border-bottom: 1px solid rgba(251, 191, 36, 0.2); display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: #fbbf24; font-weight: bold;">语音聊天</span>
+            <button id="qbVoiceClose" style="background: none; border: none; color: #9dc0ea; cursor: pointer; font-size: 18px;">×</button>
+          </div>
+          <div id="qbVoiceMessages" style="height: 280px; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px;">
+            <div style="text-align: center; color: #64748b; font-size: 12px;">暂无语音消息</div>
+          </div>
+          <div style="padding: 12px; border-top: 1px solid rgba(251, 191, 36, 0.2); display: flex; flex-direction: column; gap: 8px;">
+            <input type="text" id="qbVoiceInput" placeholder="输入文字转语音..." style="flex: 1; padding: 8px; border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 6px; background: rgba(31, 24, 10, 0.62); color: #eef6ff; font-size: 14px;">
+            <div style="display: flex; gap: 8px;">
+              <button id="qbVoiceRecord" style="flex: 1; padding: 8px 16px; background: rgba(248, 113, 113, 0.2); border: 1px solid rgba(248, 113, 113, 0.3); border-radius: 6px; color: #f87171; cursor: pointer;">按住说话</button>
+              <button id="qbVoiceSend" style="padding: 8px 16px; background: rgba(251, 191, 36, 0.2); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 6px; color: #fbbf24; cursor: pointer;">发送</button>
+            </div>
+          </div>
+        </div>
 
         <div class="qb-layout">
           <aside class="qb-panel qb-hud-panel">
@@ -3409,7 +4406,7 @@ function renderQuickBattlePage(user, options = {}) {
             <p id="qbResultText"></p>
             <div class="qb-result-actions">
               <button class="qb-primary" id="qbResultRestart" type="button">再来一局</button>
-              <a class="qb-ghost" href="/">返回大厅</a>
+              <a class="qb-ghost" href="/game">返回大厅</a>
             </div>
           </div>
         </section>
@@ -3421,6 +4418,30 @@ function renderQuickBattlePage(user, options = {}) {
   </html>`;
 }
 
+app.get("/api/art/hero/:heroId.svg", (req, res) => {
+  const heroId = String(req.params.heroId || "");
+  const svg = getHeroAvatarSvgById(heroId);
+  if (!svg) {
+    res.status(404).json({ ok: false, error: "hero_art_not_found" });
+    return;
+  }
+  res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.send(svg);
+});
+
+app.get("/api/art/card/:cardId.svg", (req, res) => {
+  const cardId = String(req.params.cardId || "");
+  const svg = getCardAvatarSvgById(cardId);
+  if (!svg) {
+    res.status(404).json({ ok: false, error: "card_art_not_found" });
+    return;
+  }
+  res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.send(svg);
+});
+
 app.get("/login", (req, res) => {
   if (!requireConfig(res)) return;
   const state = crypto.randomBytes(16).toString("hex");
@@ -3430,8 +4451,14 @@ app.get("/login", (req, res) => {
     redirect_uri: SECONDME_REDIRECT_URI,
     response_type: "code",
     state,
+    prompt: "consent",
+    scope: "user:info",
   });
   res.redirect(`${SECONDME_OAUTH_URL}?${params.toString()}`);
+});
+
+app.get("/api/auth/login", (req, res) => {
+  res.redirect(302, "/login");
 });
 
 app.get("/logout", async (req, res) => {
@@ -3441,6 +4468,872 @@ app.get("/logout", async (req, res) => {
   clearCookie(res, SESSION_COOKIE_NAME, { secure: isSecureRequest(req) });
   clearCookie(res, "oauth_state", { secure: isSecureRequest(req) });
   res.redirect("/");
+});
+
+// 匹配相关的 API 端点
+const matchQueue = new Set();
+const activeMatches = new Map();
+const matchChats = new Map();
+const userMatchTimers = new Map();
+
+// 生成AI玩家
+function generateAIPlayers(count, userId, userName) {
+  const aiPlayers = [];
+  const aiNames = [
+    "宙斯的化身", "雅典娜的使者", "湿婆的信徒", "奥丁的战士", "拉的祭司", "女娲的传人"
+  ];
+  
+  for (let i = 0; i < count; i++) {
+    aiPlayers.push({
+      id: `ai-${Date.now()}-${i}`,
+      name: aiNames[i % aiNames.length],
+      avatar: "/assets/bg-myth-war.png", // 使用默认头像
+      isAI: true,
+      masterId: userId, // 标记AI由哪个用户控制
+    });
+  }
+  
+  return aiPlayers;
+}
+
+function generateBattleSummary(history) {
+  const { result, playerName, playerHero, opponentName, opponentHero, mode, timestamp } = history;
+  const date = new Date(timestamp).toLocaleString();
+  
+  let summary = `【神迹对决】战绩分享\n\n`;
+  summary += `📅 时间：${date}\n`;
+  summary += `🎮 模式：${mode === 'ranked' ? '排位赛' : mode === 'quick' ? '快速战斗' : '休闲模式'}\n\n`;
+  summary += `👑 玩家：${playerName}（${playerHero}）\n`;
+  summary += `🤖 对手：${opponentName}（${opponentHero}）\n\n`;
+  summary += `🏆 结果：${result === 'win' ? '胜利' : '失败'}\n\n`;
+  
+  if (result === 'win') {
+    summary += `🎉 恭喜！你在这场激烈的神话对决中取得了胜利！\n`;
+    summary += `你的英雄 ${playerHero} 展现了强大的实力，成功击败了对手 ${opponentHero}。\n`;
+  } else {
+    summary += `💪 虽然这次失败了，但不要气馁！\n`;
+    summary += `你的英雄 ${playerHero} 在战斗中表现出色，下次一定能够取得胜利！\n`;
+  }
+  
+  summary += `\n#神迹对决 #游戏战绩 #神话对战`;
+  
+  return summary;
+}
+
+app.post("/api/match/join", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const userId = session.user.id;
+  const userName = session.user.name;
+  const userAvatar = session.user.avatar;
+  
+  // 检查是否已经在队列中
+  if (matchQueue.has(userId)) {
+    res.json({ ok: true, status: "waiting" });
+    return;
+  }
+  
+  // 检查是否已经在匹配中
+  for (const [matchId, match] of activeMatches.entries()) {
+    if (match.players.some(p => p.id === userId)) {
+      res.json({ ok: true, status: "matched", matchId });
+      return;
+    }
+  }
+  
+  // 尝试使用 Plaza API 获取活跃用户
+  let recommendedUsers = [];
+  try {
+    const accessToken = session.token.accessToken;
+    console.log("开始获取推荐用户（通过Plaza）");
+    
+    const plazaPaths = [
+      "/api/secondme/plaza/posts?limit=20",
+      "/api/secondme/plaza/feed?limit=20",
+      "/api/plaza/posts?limit=20"
+    ];
+    
+    for (const plazaPath of plazaPaths) {
+      try {
+        const resp = await fetch(`${SECONDME_API_BASE_URL}${plazaPath}`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+        console.log(`Plaza API 路径 ${plazaPath} 响应状态:`, resp.status);
+        
+        if (resp.ok) {
+          const json = await resp.json().catch(() => null);
+          console.log(`Plaza API 路径 ${plazaPath} 响应:`, JSON.stringify(json).slice(0, 300));
+          
+          if (json && json.data && Array.isArray(json.data) && json.data.length > 0) {
+            const userIds = new Set();
+            json.data.forEach(post => {
+              if (post.author && post.author.id && post.author.id !== userId) {
+                userIds.add(post.author.id);
+              }
+            });
+            
+            if (userIds.size > 0) {
+              recommendedUsers = Array.from(userIds).slice(0, 6).map(id => ({
+                id: id,
+                name: `用户${id}`,
+                avatar: "/assets/bg-myth-war.png"
+              }));
+              console.log("从 Plaza 获取到的推荐用户:", recommendedUsers);
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`Plaza API 路径 ${plazaPath} 出错:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error("获取推荐用户出错:", e);
+  }
+  
+  // 如果从 Plaza 获取失败，使用预定义的推荐用户列表
+  if (recommendedUsers.length === 0) {
+    console.log("Plaza API 获取失败，使用预定义推荐用户列表");
+    const defaultUserIds = ["2292998", "2158643", "2279094", "2285987", "2234123", "2312342"];
+    recommendedUsers = defaultUserIds
+      .filter(id => id !== userId)
+      .slice(0, 6)
+      .map(id => ({
+        id: id,
+        name: `用户${id}`,
+        avatar: "/assets/bg-myth-war.png"
+      }));
+  }
+  
+  console.log("推荐用户获取完成，共获取到", recommendedUsers.length, "个推荐用户");
+
+  // 如果获取到推荐用户，直接创建包含这些用户的游戏
+  if (recommendedUsers.length > 0) {
+    const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const players = [
+      {
+        id: userId,
+        name: userName,
+        avatar: userAvatar,
+        hero: req.body.hero || "",
+        isHuman: true,
+      },
+    ];
+    
+    // 添加推荐用户
+    for (let i = 0; i < Math.min(recommendedUsers.length, 6); i++) {
+      const user = recommendedUsers[i];
+      players.push({
+        id: user.id,
+        name: user.name || `SecondMe用户${user.id.slice(-4)}`,
+        avatar: user.avatar || "/assets/bg-myth-war.png",
+        hero: "",
+        isHuman: true,
+      });
+    }
+    
+    // 如果人数不足7人，生成AI玩家
+    if (players.length < 7) {
+      const aiPlayers = generateAIPlayers(7 - players.length, userId, userName);
+      players.push(...aiPlayers);
+    }
+    
+    const match = {
+      id: matchId,
+      players: players,
+      status: "ready",
+      createdAt: Date.now(),
+      isAI: false,
+    };
+    
+    activeMatches.set(matchId, match);
+    
+    // 5分钟后自动清理匹配
+    setTimeout(() => {
+      activeMatches.delete(matchId);
+    }, 5 * 60 * 1000);
+    
+    console.log("创建匹配成功，使用Discover推荐用户，匹配ID:", matchId);
+    res.json({ ok: true, status: "matched", matchId, players: players });
+    return;
+  }
+  
+  // 清除之前的定时器
+  if (userMatchTimers.has(userId)) {
+    clearTimeout(userMatchTimers.get(userId));
+    userMatchTimers.delete(userId);
+  }
+  
+  // 加入匹配队列
+  matchQueue.add(userId);
+  
+  // 设置10秒匹配时间
+  const timer = setTimeout(async () => {
+    // 检查用户是否还在队列中
+    if (matchQueue.has(userId)) {
+      // 匹配超时，生成AI玩家
+      matchQueue.delete(userId);
+      
+      // 创建匹配，包含用户和AI玩家
+      const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const aiPlayers = generateAIPlayers(6, userId, userName); // 生成6个AI玩家
+      const match = {
+        id: matchId,
+        players: [
+          {
+            id: userId,
+            name: userName,
+            avatar: userAvatar,
+            hero: req.body.hero || "",
+          },
+          ...aiPlayers
+        ],
+        status: "ready",
+        createdAt: Date.now(),
+        isAI: true, // 标记为AI匹配
+      };
+      
+      activeMatches.set(matchId, match);
+      
+      // 5分钟后自动清理匹配
+      setTimeout(() => {
+        activeMatches.delete(matchId);
+      }, 5 * 60 * 1000);
+      
+      // 通知用户匹配成功（AI）
+      // 这里可以通过WebSocket或其他方式通知，但由于我们使用轮询，用户会在下次检查状态时发现
+    }
+  }, 10000); // 10秒匹配时间
+  
+  userMatchTimers.set(userId, timer);
+  
+  // 尝试立即匹配
+  if (matchQueue.size >= 2) {
+    // 从队列中取出两个玩家
+    const players = [];
+    for (const id of matchQueue) {
+      players.push(id);
+      if (players.length === 2) break;
+    }
+    
+    // 从队列中移除这些玩家
+    for (const id of players) {
+      matchQueue.delete(id);
+      // 清除定时器
+      if (userMatchTimers.has(id)) {
+        clearTimeout(userMatchTimers.get(id));
+        userMatchTimers.delete(id);
+      }
+    }
+    
+    // 创建匹配
+    const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const match = {
+      id: matchId,
+      players: players.map(id => ({
+        id,
+        name: session.user.name,
+        avatar: session.user.avatar,
+      })),
+      status: "ready",
+      createdAt: Date.now(),
+      isAI: false, // 标记为真实玩家匹配
+    };
+    
+    activeMatches.set(matchId, match);
+    
+    // 5分钟后自动清理匹配
+    setTimeout(() => {
+      activeMatches.delete(matchId);
+    }, 5 * 60 * 1000);
+    
+    res.json({ ok: true, status: "matched", matchId });
+  } else {
+    res.json({ ok: true, status: "waiting" });
+  }
+});
+
+// 手动匹配其他SecondMe用户
+app.post("/api/match/manual", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const userId = session.user.id;
+  const userName = session.user.name;
+  const userAvatar = session.user.avatar;
+  const { playerIds } = req.body;
+  
+  if (!Array.isArray(playerIds)) {
+    res.status(400).json({ ok: false, error: "invalid_player_ids" });
+    return;
+  }
+  
+  // 过滤掉自己
+  const otherPlayerIds = playerIds.filter(id => id !== userId);
+  
+  // 创建匹配
+  const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const players = [
+    {
+      id: userId,
+      name: userName,
+      avatar: userAvatar,
+      hero: req.body.hero || "",
+      isHuman: true,
+    },
+  ];
+  
+  // 添加其他玩家
+  for (const playerId of otherPlayerIds) {
+    players.push({
+      id: playerId,
+      name: `SecondMe玩家${playerId.slice(-4)}`, // 临时名称，实际应该从SecondMe API获取
+      avatar: "/assets/bg-myth-war.png", // 临时头像
+      hero: "", // 临时英雄，实际应该由玩家选择
+      isHuman: true,
+    });
+  }
+  
+  // 生成AI玩家以达到7人
+  if (players.length < 7) {
+    const aiPlayers = generateAIPlayers(7 - players.length, userId, userName);
+    players.push(...aiPlayers);
+  }
+  
+  const match = {
+    id: matchId,
+    players,
+    status: "ready",
+    createdAt: Date.now(),
+    isAI: false, // 标记为真实玩家匹配
+  };
+  
+  activeMatches.set(matchId, match);
+  
+  // 5分钟后自动清理匹配
+  setTimeout(() => {
+    activeMatches.delete(matchId);
+  }, 5 * 60 * 1000);
+  
+  res.json({ ok: true, status: "matched", matchId });
+});
+
+app.post("/api/match/leave", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const userId = session.user.id;
+  matchQueue.delete(userId);
+  
+  // 清除定时器
+  if (userMatchTimers.has(userId)) {
+    clearTimeout(userMatchTimers.get(userId));
+    userMatchTimers.delete(userId);
+  }
+  
+  // 从活跃匹配中移除
+  for (const [matchId, match] of activeMatches.entries()) {
+    if (match.players.some(p => p.id === userId)) {
+      activeMatches.delete(matchId);
+      break;
+    }
+  }
+  
+  res.json({ ok: true });
+});
+
+app.get("/api/match/status", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const userId = session.user.id;
+  
+  // 检查是否在队列中
+  if (matchQueue.has(userId)) {
+    res.json({ ok: true, status: "waiting" });
+    return;
+  }
+  
+  // 检查是否在活跃匹配中
+  for (const [matchId, match] of activeMatches.entries()) {
+    if (match.players.some(p => p.id === userId)) {
+      res.json({ ok: true, status: "matched", matchId, match });
+      return;
+    }
+  }
+  
+  res.json({ ok: true, status: "none" });
+});
+
+// 获取匹配中的玩家信息
+app.get("/api/match/:matchId/players", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const matchId = req.params.matchId;
+  const match = activeMatches.get(matchId);
+  
+  if (!match) {
+    res.status(404).json({ ok: false, error: "match_not_found" });
+    return;
+  }
+  
+  res.json({ ok: true, players: match.players });
+});
+
+// 发送聊天消息
+app.post("/api/match/:matchId/chat", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const matchId = req.params.matchId;
+  const { message, playerId: requestPlayerId } = req.body;
+  
+  if (!message || typeof message !== "string" || message.trim().length === 0) {
+    res.status(400).json({ ok: false, error: "invalid_message" });
+    return;
+  }
+  
+  const match = activeMatches.get(matchId);
+  if (!match) {
+    res.status(404).json({ ok: false, error: "match_not_found" });
+    return;
+  }
+  
+  // 确定发送消息的玩家
+  let player;
+  if (requestPlayerId) {
+    // 允许其他玩家或AI通过SecondMe发送消息
+    player = match.players.find(p => p.id === requestPlayerId);
+  } else {
+    // 默认使用当前会话用户
+    player = match.players.find(p => p.id === session.user.id);
+  }
+  
+  if (!player) {
+    res.status(403).json({ ok: false, error: "not_in_match" });
+    return;
+  }
+  
+  // 初始化聊天记录
+  if (!matchChats.has(matchId)) {
+    matchChats.set(matchId, []);
+  }
+  
+  const chatMessage = {
+    id: Date.now().toString(),
+    playerId: player.id,
+    playerName: player.name,
+    message: message.trim().slice(0, 200),
+    timestamp: Date.now(),
+  };
+  
+  matchChats.get(matchId).push(chatMessage);
+  
+  // 只保留最近50条消息
+  const chats = matchChats.get(matchId);
+  if (chats.length > 50) {
+    matchChats.set(matchId, chats.slice(-50));
+  }
+  
+  res.json({ ok: true, message: chatMessage });
+});
+
+// 获取聊天消息
+app.get("/api/match/:matchId/chat", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const matchId = req.params.matchId;
+  const match = activeMatches.get(matchId);
+  
+  if (!match) {
+    res.status(404).json({ ok: false, error: "match_not_found" });
+    return;
+  }
+  
+  const chats = matchChats.get(matchId) || [];
+  res.json({ ok: true, chats: chats });
+});
+
+app.get("/api/match/recommend", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const userId = session.user.id;
+  
+  // 使用预定义的推荐用户列表
+  const defaultUserIds = ["2292998", "2158643", "2279094", "2285987", "2234123", "2312342"];
+  const recommendedUsers = defaultUserIds
+    .filter(id => id !== userId)
+    .slice(0, 6)
+    .map(id => ({
+      id: id,
+      name: `用户${id}`,
+      avatar: "/assets/bg-myth-war.png"
+    }));
+  
+  res.json({ ok: true, users: recommendedUsers });
+});
+
+// SecondMe 思考 API 端点
+app.post("/api/secondme/think", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  
+  const { gameState, action, actorId, actorName, handCards } = req.body;
+  if (!gameState || typeof gameState !== "object") {
+    res.status(400).json({ ok: false, error: "invalid_game_state" });
+    return;
+  }
+  
+  try {
+    const accessToken = session.token.accessToken;
+    
+    const cardList = handCards?.join("、") || "无";
+    const playerInfo = gameState.actor ? 
+      `${gameState.actor.name}(${gameState.actor.faction}) 当前体力:${gameState.actor.hp}/${gameState.actor.maxHp}，手牌:[${cardList}]` :
+      `当前玩家体力:${gameState.hp}/${gameState.maxHp}，手牌:[${cardList}]`;
+    
+    const otherPlayers = gameState.players?.map(p => 
+      `${p.name}(${p.faction}) 体力:${p.hp}/${p.maxHp} 距离:${p.distance}${p.isHuman ? '(人类)' : ''}${p.role ? ' 身份:'+p.role : ''}`
+    ).join("；") || "无";
+    
+    const prompt = `你是一个卡牌游戏"神迹对决"的AI玩家。请根据以下游戏状态，给出具体的出牌决策。
+
+当前玩家信息：${playerInfo}
+其他玩家信息：${otherPlayers}
+当前回合：${gameState.turn}，阶段：${gameState.phase}
+牌堆：摸牌堆${gameState.drawPileCount || 0}张，弃牌堆${gameState.discardPileCount || 0}张
+
+请按以下JSON格式返回你的决策（只需要返回JSON，不要其他内容）：
+{
+  "thinking": "你的思考过程",
+  "action": "pass" 或 "play" 或 "attack" 或 "heal" 或 "equip"，
+  "cardName": "要使用的卡牌名称，如果不使用任何卡牌则为空",
+  "targetId": "目标玩家ID，如果不指定目标则为空",
+  "reason": "你做出这个决策的原因"
+}`;
+
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "system",
+            content: "你是一个卡牌游戏专家，擅长分析游戏状态并做出最佳决策。请严格按照JSON格式返回决策结果。",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+    
+    const json = await resp.json().catch(() => null);
+    if (resp.ok && json && json.code === 0 && json.data?.content) {
+      const content = json.data.content;
+      
+      let structuredDecision = null;
+      try {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          structuredDecision = JSON.parse(jsonMatch[0]);
+        }
+      } catch (e) {
+        console.log("解析SecondMe返回的JSON失败:", e);
+      }
+      
+      res.json({ 
+        ok: true, 
+        think: content,
+        decision: structuredDecision
+      });
+    } else {
+      res.status(500).json({ ok: false, error: "secondme_think_failed" });
+    }
+  } catch (error) {
+    res.status(500).json({ ok: false, error: "secondme_think_failed" });
+  }
+});
+
+app.post("/api/battle/history", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  const history = req.body;
+  if (!history || typeof history !== "object") {
+    res.status(400).json({ ok: false, error: "invalid_history_data" });
+    return;
+  }
+  try {
+    // 添加新的历史记录
+    const newHistory = {
+      ...history,
+      timestamp: Date.now(),
+    };
+    
+    // 尝试使用 SecondMe Key Memory 存储战绩
+    if (session?.token?.accessToken) {
+      const accessToken = session.token.accessToken;
+      // 先获取现有的 Key Memory
+      let existingHistory = [];
+      try {
+        const getResp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+        console.log("SecondMe Key Memory 获取响应状态:", getResp.status);
+        const getJson = await getResp.json().catch(() => null);
+        console.log("SecondMe Key Memory 获取响应数据:", getJson);
+        if (getResp.ok && getJson && getJson.code === 0 && Array.isArray(getJson.data)) {
+          // 查找历史记录数据
+          const historyData = getJson.data.find(item => item.key === "battle_history");
+          if (historyData && historyData.value) {
+            existingHistory = Array.isArray(historyData.value) ? historyData.value : [];
+          }
+        }
+      } catch (e) {
+        console.error("获取 SecondMe Key Memory 出错:", e);
+      }
+      
+      // 添加新的历史记录
+      existingHistory.unshift(newHistory);
+      // 只保留最近 50 条战绩
+      if (existingHistory.length > 50) {
+        existingHistory = existingHistory.slice(0, 50);
+      }
+      
+      // 保存到 SecondMe Key Memory
+      try {
+        const setResp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            key: "battle_history",
+            value: existingHistory,
+            timestamp: Date.now(),
+          }),
+        });
+        console.log("SecondMe Key Memory 保存响应状态:", setResp.status);
+        const setJson = await setResp.json().catch(() => null);
+        console.log("SecondMe Key Memory 保存响应数据:", setJson);
+        if (setResp.ok && setJson && setJson.code === 0) {
+          console.log("保存战绩到 SecondMe Key Memory 成功");
+        } else {
+          console.log("保存战绩到 SecondMe Key Memory 失败");
+        }
+      } catch (e) {
+        console.error("保存战绩到 SecondMe Key Memory 出错:", e);
+      }
+    }
+    
+    // 保存历史记录到数据库（作为 fallback）
+    const userId = session?.user?.id || 'anonymous';
+    try {
+      if (db) {
+        // 插入新的历史记录
+        await db.run(
+          `INSERT INTO battle_history (user_id, result, player_name, player_hero, opponent_name, opponent_hero, mode, timestamp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, newHistory.result, newHistory.playerName, newHistory.playerHero, newHistory.opponentName, newHistory.opponentHero, newHistory.mode, newHistory.timestamp]
+        );
+        
+        // 只保留最近 50 条战绩
+        await db.run(
+          `DELETE FROM battle_history WHERE user_id = ? AND id NOT IN (
+            SELECT id FROM battle_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50
+          )`,
+          [userId, userId]
+        );
+        
+        console.log("保存战绩到数据库成功");
+      } else {
+        console.log("数据库未初始化，跳过保存到数据库");
+      }
+    } catch (e) {
+      console.error("保存战绩到数据库出错:", e);
+    }
+    
+    // 发布帖子到 Plaza
+    if (session?.token?.accessToken) {
+      try {
+        const accessToken = session.token.accessToken;
+        
+        // 生成战绩总结
+        const battleSummary = generateBattleSummary(newHistory);
+        
+        // 发布帖子到 Plaza
+        const postResp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/plaza/post`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            content: battleSummary,
+            isPublic: true,
+            tags: ["游戏", "神迹对决", "战绩"],
+            timestamp: Date.now(),
+          }),
+        });
+        
+        console.log("Plaza 帖子发布响应状态:", postResp.status);
+        const postJson = await postResp.json().catch(() => null);
+        console.log("Plaza 帖子发布响应数据:", postJson);
+        
+        if (postResp.ok && postJson && postJson.code === 0) {
+          console.log("发布战绩到 Plaza 成功");
+        } else {
+          console.log("发布战绩到 Plaza 失败");
+        }
+      } catch (e) {
+        console.error("发布战绩到 Plaza 出错:", e);
+      }
+    }
+    
+    // 同时保存到会话存储，以便下次访问时更快加载
+    if (!session.battleHistory) session.battleHistory = [];
+    session.battleHistory.unshift(newHistory);
+    // 只保留最近 50 条战绩
+    if (session.battleHistory.length > 50) {
+      session.battleHistory = session.battleHistory.slice(0, 50);
+    }
+    await persistSession(req, res, "", session);
+    
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("保存战绩出错:", error);
+    // 出错时回退到会话存储
+    try {
+      if (!session.battleHistory) session.battleHistory = [];
+      session.battleHistory.unshift({
+        ...history,
+        timestamp: Date.now(),
+      });
+      if (session.battleHistory.length > 50) {
+        session.battleHistory = session.battleHistory.slice(0, 50);
+      }
+      await persistSession(req, res, "", session);
+      res.json({ ok: true, warning: "Error saving to storage, using session storage" });
+    } catch (e) {
+      res.json({ ok: true, warning: "Error saving history, but game ended successfully" });
+    }
+  }
+});
+
+app.get("/api/battle/history", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  try {
+    let history = [];
+    
+    // 尝试从 SecondMe Key Memory 加载战绩
+    if (session?.token?.accessToken) {
+      const accessToken = session.token.accessToken;
+      console.log("尝试从 SecondMe Key Memory 加载战绩");
+      try {
+        const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+        console.log("SecondMe Key Memory 响应状态:", resp.status);
+        const json = await resp.json().catch(() => null);
+        console.log("SecondMe Key Memory 响应数据:", json);
+        if (resp.ok && json && json.code === 0 && Array.isArray(json.data)) {
+          // 查找历史记录数据
+          const historyData = json.data.find(item => item.key === "battle_history");
+          if (historyData && historyData.value) {
+            history = Array.isArray(historyData.value) ? historyData.value : [];
+            console.log("从 SecondMe Key Memory 加载到的战绩:", history);
+          }
+        }
+      } catch (e) {
+        console.error("从 SecondMe Key Memory 加载战绩出错:", e);
+      }
+    }
+    
+    // 如果从 SecondMe Key Memory 加载失败，尝试从数据库加载
+    if (history.length === 0) {
+      const userId = session?.user?.id || 'anonymous';
+      try {
+        if (db) {
+          // 从数据库加载历史记录
+          const rows = await db.all(
+            `SELECT result, player_name as playerName, player_hero as playerHero, opponent_name as opponentName, opponent_hero as opponentHero, mode, timestamp
+             FROM battle_history
+             WHERE user_id = ?
+             ORDER BY timestamp DESC
+             LIMIT 50`,
+            [userId]
+          );
+          
+          history = rows;
+          console.log("从数据库加载到的战绩:", history);
+        } else {
+          console.log("数据库未初始化，跳过从数据库加载");
+        }
+      } catch (e) {
+        console.error("从数据库加载战绩出错:", e);
+        history = [];
+      }
+    }
+    
+    // 保存到会话存储，以便下次访问时更快加载
+    if (history.length > 0) {
+      session.battleHistory = history;
+      await persistSession(req, res, "", session);
+    }
+    
+    res.json({ ok: true, data: history });
+  } catch (error) {
+    console.error("加载战绩出错:", error);
+    // 出错时回退到会话存储
+    try {
+      const history = Array.isArray(session?.battleHistory) ? session.battleHistory : [];
+      console.log("出错时从会话存储加载到的战绩:", history);
+      res.json({ ok: true, data: history, warning: "Error loading from storage, using session storage" });
+    } catch (e) {
+      res.json({ ok: true, data: [], warning: "Error loading history, returning empty array" });
+    }
+  }
 });
 
 app.get("/api/auth/callback", async (req, res) => {
@@ -3490,13 +5383,10 @@ app.get("/api/auth/callback", async (req, res) => {
       res.status(400).send(`<pre>${JSON.stringify(userJson, null, 2)}</pre><p><a href="/">返回首页</a></p>`);
       return;
     }
-    const friends = await fetchSecondMeFriends(accessToken);
-
     const sid = existingSid || crypto.randomBytes(24).toString("hex");
     const nextSession = {
       user: userJson.data,
       token: tokenJson.data,
-      friends,
       rankProgress: createRankProgress(existingSession?.rankProgress?.score || 0),
       createdAt: existingSession?.createdAt || Date.now(),
     };
@@ -3508,22 +5398,265 @@ app.get("/api/auth/callback", async (req, res) => {
   }
 });
 
+// 匹配页面
+app.get("/match", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.redirect("/login");
+    return;
+  }
+  const mode = req.query.mode || "quick";
+  const hero = req.query.hero || "";
+  res.send(`<!doctype html>
+  <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>神迹对决 - 匹配中</title>
+      <style>
+        body {
+          margin: 0;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          background: linear-gradient(135deg, rgba(26, 26, 46, 0.8) 0%, rgba(22, 33, 62, 0.8) 100%), url('/assets/myth-gods-battle-animated.svg?v=${Date.now()}');
+          background-size: cover;
+          background-position: center;
+          background-repeat: no-repeat;
+          color: #eef6ff;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          min-height: 100vh;
+          animation: backgroundShift 30s ease-in-out infinite;
+        }
+        @keyframes backgroundShift {
+          0%, 100% { background-position: center center; }
+          50% { background-position: center 5% center; }
+        }
+        .match-container {
+          text-align: center;
+          padding: 40px;
+          border-radius: 14px;
+          background: rgba(31, 24, 10, 0.62);
+          border: 1px solid rgba(251, 191, 36, 0.35);
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+          backdrop-filter: blur(10px);
+        }
+        .match-logo {
+          width: 120px;
+          height: 120px;
+          margin-bottom: 24px;
+        }
+        .match-title {
+          font-size: 24px;
+          font-weight: 800;
+          margin-bottom: 16px;
+          color: #fbbf24;
+        }
+        .match-subtitle {
+          font-size: 16px;
+          color: #9dc0ea;
+          margin-bottom: 32px;
+        }
+        .match-status {
+          font-size: 18px;
+          margin-bottom: 24px;
+        }
+        .match-spinner {
+          width: 60px;
+          height: 60px;
+          border: 4px solid rgba(251, 191, 36, 0.3);
+          border-top: 4px solid #fbbf24;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+          margin: 0 auto 24px;
+        }
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        .match-cancel-btn {
+          background: rgba(248, 113, 113, 0.2);
+          color: #f87171;
+          border: 1px solid rgba(248, 113, 113, 0.4);
+          border-radius: 999px;
+          padding: 10px 24px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+        .match-cancel-btn:hover {
+          background: rgba(248, 113, 113, 0.3);
+        }
+        .match-timer {
+          font-size: 36px;
+          font-weight: 800;
+          color: #fbbf24;
+          margin: 16px 0;
+          animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+          0% { transform: scale(1); }
+          50% { transform: scale(1.1); }
+          100% { transform: scale(1); }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="match-container">
+        <img class="match-logo" src="/shenji-logo.png" alt="神迹对决" />
+        <h1 class="match-title">神迹对决</h1>
+        <p class="match-subtitle">正在寻找对手...</p>
+        <div class="match-spinner"></div>
+        <div class="match-status" id="matchStatus">匹配中，请稍候...</div>
+        <div class="match-timer" id="matchTimer">10</div>
+        <button class="match-cancel-btn" id="cancelMatch">取消匹配</button>
+      </div>
+      <script>
+        const mode = "${mode}";
+        const hero = "${hero}";
+        
+        // 加入匹配队列
+        async function joinMatch() {
+          try {
+            const resp = await fetch("/api/match/join", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            });
+            const json = await resp.json();
+            if (json.ok) {
+              checkMatchStatus();
+            } else {
+              document.getElementById("matchStatus").textContent = "匹配失败，请重试";
+            }
+          } catch (error) {
+            console.error("加入匹配队列失败:", error);
+            document.getElementById("matchStatus").textContent = "匹配失败，请重试";
+          }
+        }
+        
+        // 检查匹配状态
+        async function checkMatchStatus() {
+          try {
+            const resp = await fetch("/api/match/status");
+            const json = await resp.json();
+            if (json.ok) {
+              if (json.status === "matched") {
+                // 匹配成功，跳转到游戏页面
+                window.location.href = "/battle/" + mode + "?hero=" + hero + "&matchId=" + json.matchId;
+              } else if (json.status === "waiting") {
+                // 继续等待
+                document.getElementById("matchStatus").textContent = "匹配中，请稍候...";
+                setTimeout(checkMatchStatus, 2000);
+              } else {
+                // 不在队列中，重新加入
+                joinMatch();
+              }
+            } else {
+              document.getElementById("matchStatus").textContent = "匹配失败，请重试";
+            }
+          } catch (error) {
+            console.error("检查匹配状态失败:", error);
+            setTimeout(checkMatchStatus, 2000);
+          }
+        }
+        
+        // 取消匹配
+        document.getElementById("cancelMatch").addEventListener("click", async function() {
+          try {
+            const resp = await fetch("/api/match/leave", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            });
+            const json = await resp.json();
+            if (json.ok) {
+              window.location.href = "/game";
+            }
+          } catch (error) {
+            console.error("取消匹配失败:", error);
+          }
+        });
+        
+        // 10秒倒计时
+        let countdown = 10;
+        const timerElement = document.getElementById("matchTimer");
+        
+        const countdownInterval = setInterval(() => {
+          countdown--;
+          if (countdown >= 0) {
+            timerElement.textContent = countdown;
+          } else {
+            clearInterval(countdownInterval);
+          }
+        }, 1000);
+        
+        // 开始匹配
+        joinMatch();
+        
+        // 取消匹配时清除倒计时
+        document.getElementById("cancelMatch").addEventListener("click", function() {
+          clearInterval(countdownInterval);
+        });
+      </script>
+    </body>
+  </html>`);
+});
+
 app.get("/battle/quick", async (req, res) => {
-  const { session } = await getOrCreateSession(req, res);
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.redirect("/login");
+    return;
+  }
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
-  res.send(renderQuickBattlePage(session?.user || null, { mode: "quick", selectedHeroId: hero, rankProgress: session.rankProgress }));
+  const matchId = req.query.matchId || "";
+  
+  // 如果没有 matchId，重定向到匹配页面
+  if (!matchId) {
+    res.redirect(`/match?mode=quick&hero=${hero}`);
+    return;
+  }
+  
+  res.send(renderQuickBattlePage(session?.user || null, { mode: "quick", selectedHeroId: hero, rankProgress: session.rankProgress, matchId: matchId }));
 });
 
 app.get("/battle/slaughter", async (req, res) => {
-  const { session } = await getOrCreateSession(req, res);
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.redirect("/login");
+    return;
+  }
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
-  res.send(renderQuickBattlePage(session?.user || null, { mode: "slaughter", selectedHeroId: hero, rankProgress: session.rankProgress }));
+  const matchId = req.query.matchId || "";
+  
+  // 如果没有 matchId，重定向到匹配页面
+  if (!matchId) {
+    res.redirect(`/match?mode=slaughter&hero=${hero}`);
+    return;
+  }
+  
+  res.send(renderQuickBattlePage(session?.user || null, { mode: "slaughter", selectedHeroId: hero, rankProgress: session.rankProgress, matchId: matchId }));
 });
 
 app.get("/battle/ranked", async (req, res) => {
-  const { session } = await getOrCreateSession(req, res);
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.redirect("/login");
+    return;
+  }
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
-  res.send(renderQuickBattlePage(session?.user || null, { mode: "ranked", selectedHeroId: hero, rankProgress: session.rankProgress }));
+  const matchId = req.query.matchId || "";
+  
+  // 如果没有 matchId，重定向到匹配页面
+  if (!matchId) {
+    res.redirect(`/match?mode=ranked&hero=${hero}`);
+    return;
+  }
+  
+  res.send(renderQuickBattlePage(session?.user || null, { mode: "ranked", selectedHeroId: hero, rankProgress: session.rankProgress, matchId: matchId }));
 });
 
 app.get("/tutorial", async (req, res) => {
@@ -3537,14 +5670,9 @@ app.get("/tutorial", async (req, res) => {
   );
 });
 
-app.get("/", async (req, res) => {
+app.get("/game", async (req, res) => {
   if (!requireConfig(res)) return;
   const { sid, session } = await getOrCreateSession(req, res);
-  if (session?.token?.accessToken) {
-    const latestFriends = await fetchSecondMeFriends(session.token.accessToken);
-    session.friends = latestFriends;
-    await saveStoredSession(sid, session);
-  }
   const html = renderPage({
     isLoggedIn: Boolean(session?.user),
     user: session?.user || null,
@@ -3554,46 +5682,568 @@ app.get("/", async (req, res) => {
   res.send(html);
 });
 
-app.post("/api/friends/invite", async (req, res) => {
+function renderLoginPage() {
+  return `<!doctype html>
+  <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>登录 - 神迹对决</title>
+      <style>
+        :root {
+          --bg: #0a1120;
+          --card: rgba(11, 18, 31, 0.85);
+          --line: rgba(147, 197, 253, 0.2);
+          --text: #ecf4ff;
+          --muted: #aac3e8;
+          --primary: #3b82f6;
+          --primary-strong: #1d4ed8;
+          --gold: #f59e0b;
+          --purple: #8b5cf6;
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+          color: var(--text);
+          background: var(--bg);
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          position: relative;
+          overflow: hidden;
+        }
+        /* 视频背景 */
+        .video-background {
+          position: fixed;
+          inset: 0;
+          z-index: -2;
+          object-fit: cover;
+          width: 100%;
+          height: 100%;
+          opacity: 0.7;
+        }
+        /* 渐变遮罩 */
+        body::after {
+          content: "";
+          position: fixed;
+          inset: 0;
+          background: linear-gradient(
+            180deg, 
+            rgba(5, 9, 16, 0.7) 0%, 
+            rgba(7, 10, 16, 0.85) 50%, 
+            rgba(10, 15, 25, 0.9) 100%
+          );
+          z-index: -1;
+        }
+        /* 光效效果 */
+        .light-effects {
+          position: fixed;
+          inset: 0;
+          z-index: -1;
+          pointer-events: none;
+        }
+        .light-effect {
+          position: absolute;
+          border-radius: 50%;
+          filter: blur(60px);
+          animation: lightPulse 8s ease-in-out infinite;
+        }
+        .light-effect:nth-child(1) {
+          top: 20%;
+          left: 20%;
+          width: 300px;
+          height: 300px;
+          background: rgba(59, 130, 246, 0.2);
+          animation-delay: 0s;
+        }
+        .light-effect:nth-child(2) {
+          top: 60%;
+          right: 20%;
+          width: 250px;
+          height: 250px;
+          background: rgba(139, 92, 246, 0.2);
+          animation-delay: 2s;
+        }
+        .light-effect:nth-child(3) {
+          bottom: 20%;
+          left: 40%;
+          width: 200px;
+          height: 200px;
+          background: rgba(245, 158, 11, 0.2);
+          animation-delay: 4s;
+        }
+        /* 粒子效果容器 */
+        .particles {
+          position: fixed;
+          inset: 0;
+          z-index: -1;
+          pointer-events: none;
+        }
+        .particle {
+          position: absolute;
+          width: 2px;
+          height: 2px;
+          background: white;
+          border-radius: 50%;
+          animation: particleFloat 10s linear infinite;
+        }
+        /* 动画定义 */
+        @keyframes lightPulse {
+          0%, 100% { 
+            opacity: 0.3;
+            transform: scale(1);
+          }
+          50% { 
+            opacity: 0.6;
+            transform: scale(1.2);
+          }
+        }
+        @keyframes particleFloat {
+          0% { 
+            transform: translateY(100vh) translateX(0);
+            opacity: 0;
+          }
+          10% { 
+            opacity: 1;
+          }
+          90% { 
+            opacity: 1;
+          }
+          100% { 
+            transform: translateY(-100px) translateX(100px);
+            opacity: 0;
+          }
+        }
+        .login-wrap {
+          max-width: 480px;
+          width: 100%;
+          padding: 24px;
+          position: relative;
+          z-index: 2;
+        }
+        .login-card {
+          background: var(--card);
+          border: 1px solid var(--line);
+          border-radius: 20px;
+          padding: 32px;
+          text-align: center;
+          backdrop-filter: blur(10px);
+          box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.3),
+            0 0 0 1px rgba(255, 255, 255, 0.05),
+            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+          transition: all 0.3s ease;
+          position: relative;
+          overflow: hidden;
+        }
+        .login-card::before {
+          content: "";
+          position: absolute;
+          top: -50%;
+          left: -50%;
+          width: 200%;
+          height: 200%;
+          background: linear-gradient(
+            45deg,
+            transparent,
+            rgba(255, 255, 255, 0.05),
+            transparent
+          );
+          transform: rotate(45deg);
+          animation: shine 6s linear infinite;
+          pointer-events: none;
+        }
+        @keyframes shine {
+          0% { 
+            transform: translateX(-100%) rotate(45deg); 
+          }
+          100% { 
+            transform: translateX(100%) rotate(45deg); 
+          }
+        }
+        .login-card:hover {
+          box-shadow: 
+            0 12px 40px rgba(0, 0, 0, 0.4),
+            0 0 0 1px rgba(255, 255, 255, 0.1),
+            inset 0 1px 0 rgba(255, 255, 255, 0.15);
+          transform: translateY(-2px);
+        }
+        .login-title {
+          margin: 0 0 8px;
+          font-size: 36px;
+          font-weight: 800;
+          background: linear-gradient(135deg, #fff, #a78bfa, #f59e0b);
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
+          text-shadow: 
+            0 2px 4px rgba(0, 0, 0, 0.3),
+            0 0 10px rgba(167, 139, 250, 0.3);
+          animation: titleGlow 3s ease-in-out infinite;
+        }
+        @keyframes titleGlow {
+          0%, 100% { 
+            text-shadow: 
+              0 2px 4px rgba(0, 0, 0, 0.3),
+              0 0 10px rgba(167, 139, 250, 0.3);
+          }
+          50% { 
+            text-shadow: 
+              0 2px 4px rgba(0, 0, 0, 0.3),
+              0 0 20px rgba(167, 139, 250, 0.5),
+              0 0 30px rgba(245, 158, 11, 0.3);
+          }
+        }
+        .login-subtitle {
+          margin: 0 0 32px;
+          color: var(--muted);
+          font-size: 16px;
+          text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+        }
+        .login-logo {
+          width: 100px;
+          height: 100px;
+          margin: 0 auto 24px;
+          background: linear-gradient(135deg, var(--primary), var(--primary-strong), var(--purple));
+          border-radius: 24px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 40px;
+          font-weight: 700;
+          box-shadow: 
+            0 4px 16px rgba(59, 130, 246, 0.4),
+            0 0 30px rgba(139, 92, 246, 0.3);
+          animation: logoPulse 2s ease-in-out infinite;
+          position: relative;
+          overflow: hidden;
+        }
+        .login-logo::before {
+          content: "";
+          position: absolute;
+          top: -50%;
+          left: -50%;
+          width: 200%;
+          height: 200%;
+          background: linear-gradient(
+            45deg,
+            transparent,
+            rgba(255, 255, 255, 0.2),
+            transparent
+          );
+          transform: rotate(45deg);
+          animation: logoShine 3s linear infinite;
+        }
+        @keyframes logoShine {
+          0% { 
+            transform: translateX(-100%) rotate(45deg); 
+          }
+          100% { 
+            transform: translateX(100%) rotate(45deg); 
+          }
+        }
+        @keyframes logoPulse {
+          0% { 
+            box-shadow: 
+              0 4px 16px rgba(59, 130, 246, 0.4),
+              0 0 30px rgba(139, 92, 246, 0.3);
+          }
+          50% { 
+            box-shadow: 
+              0 6px 24px rgba(59, 130, 246, 0.6),
+              0 0 40px rgba(139, 92, 246, 0.5);
+          }
+          100% { 
+            box-shadow: 
+              0 4px 16px rgba(59, 130, 246, 0.4),
+              0 0 30px rgba(139, 92, 246, 0.3);
+          }
+        }
+        .login-btn {
+          display: inline-block;
+          width: 100%;
+          padding: 16px 24px;
+          background: linear-gradient(135deg, var(--primary), var(--primary-strong), var(--purple));
+          color: #fff;
+          border: none;
+          border-radius: 12px;
+          font-size: 16px;
+          font-weight: 600;
+          text-decoration: none;
+          transition: all 0.3s ease;
+          box-shadow: 
+            0 4px 12px rgba(59, 130, 246, 0.3),
+            0 0 20px rgba(139, 92, 246, 0.2);
+          position: relative;
+          overflow: hidden;
+        }
+        .login-btn::before {
+          content: "";
+          position: absolute;
+          top: -50%;
+          left: -50%;
+          width: 200%;
+          height: 200%;
+          background: linear-gradient(
+            45deg,
+            transparent,
+            rgba(255, 255, 255, 0.2),
+            transparent
+          );
+          transform: rotate(45deg);
+          animation: btnShine 3s linear infinite;
+        }
+        @keyframes btnShine {
+          0% { 
+            transform: translateX(-100%) rotate(45deg); 
+          }
+          100% { 
+            transform: translateX(100%) rotate(45deg); 
+          }
+        }
+        .login-btn:hover {
+          background: linear-gradient(135deg, var(--purple), var(--primary-strong), var(--primary));
+          transform: translateY(-2px);
+          box-shadow: 
+            0 6px 16px rgba(59, 130, 246, 0.4),
+            0 0 30px rgba(139, 92, 246, 0.3);
+        }
+        .login-btn:active {
+          transform: translateY(0);
+        }
+        .login-footer {
+          margin-top: 24px;
+          color: var(--muted);
+          font-size: 14px;
+          text-align: center;
+          text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+        }
+        /* 背景故事文本 */
+        .background-story {
+          position: fixed;
+          bottom: 20px;
+          left: 0;
+          right: 0;
+          text-align: center;
+          padding: 0 20px;
+          z-index: 1;
+          max-width: 800px;
+          margin: 0 auto;
+        }
+        .background-story p {
+          margin: 5px 0;
+          font-size: 14px;
+          color: var(--muted);
+          text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+          line-height: 1.5;
+        }
+        /* 音频控制 */
+        .audio-control {
+          position: fixed;
+          top: 20px;
+          right: 20px;
+          z-index: 10;
+          background: rgba(11, 18, 31, 0.8);
+          border: 1px solid var(--line);
+          border-radius: 50%;
+          width: 48px;
+          height: 48px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          backdrop-filter: blur(10px);
+          transition: all 0.3s ease;
+        }
+        .audio-control:hover {
+          background: rgba(11, 18, 31, 0.9);
+          transform: scale(1.1);
+        }
+        .audio-control::before {
+          content: "🔊";
+          font-size: 20px;
+        }
+        .audio-control.muted::before {
+          content: "🔇";
+        }
+        /* 响应式设计 */
+        @media (max-width: 768px) {
+          .login-wrap {
+            padding: 16px;
+          }
+          .login-card {
+            padding: 24px;
+          }
+          .login-title {
+            font-size: 28px;
+          }
+          .login-subtitle {
+            font-size: 14px;
+          }
+          .login-logo {
+            width: 80px;
+            height: 80px;
+            font-size: 32px;
+          }
+          .background-story {
+            bottom: 10px;
+            padding: 0 10px;
+          }
+          .background-story p {
+            font-size: 12px;
+          }
+          .audio-control {
+            top: 10px;
+            right: 10px;
+            width: 40px;
+            height: 40px;
+          }
+          .audio-control::before {
+            font-size: 16px;
+          }
+        }
+        @media (max-width: 480px) {
+          .login-card {
+            padding: 20px;
+          }
+          .login-title {
+            font-size: 24px;
+          }
+          .login-subtitle {
+            font-size: 13px;
+          }
+          .login-logo {
+            width: 60px;
+            height: 60px;
+            font-size: 24px;
+          }
+          .background-story p {
+            font-size: 11px;
+          }
+        }
+      </style>
+    </head>
+    <body>
+      <!-- 视频背景 -->
+      <video class="video-background" autoplay muted loop playsinline>
+        <source src="https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=mythological%20gods%20battle%20scene%20with%20divine%20beings%20fighting%2C%20epic%20visuals%2C%20fantasy%20style%2C%204k%20resolution&image_size=landscape_16_9" type="video/mp4">
+        Your browser does not support the video tag.
+      </video>
+      
+      <!-- 光效效果 -->
+      <div class="light-effects">
+        <div class="light-effect"></div>
+        <div class="light-effect"></div>
+        <div class="light-effect"></div>
+      </div>
+      
+      <!-- 粒子效果 -->
+      <div class="particles" id="particles"></div>
+      
+      <!-- 音频控制 -->
+      <div class="audio-control" id="audioControl"></div>
+      
+      <div class="login-wrap">
+        <div class="login-card">
+          <div class="login-logo">神</div>
+          <h1 class="login-title">神迹对决</h1>
+          <p class="login-subtitle">登录后开始你的神话之旅</p>
+          <a class="login-btn" href="/login">SecondMe 登录</a>
+        </div>
+        <div class="login-footer">
+          <p>© 2026 神迹对决. 保留所有权利.</p>
+        </div>
+      </div>
+      
+      <!-- 背景故事文本 -->
+      <div class="background-story">
+        <p>在诸神的黄昏中，不同神话体系的神灵们为了争夺宇宙的控制权而展开了一场史诗般的对决。</p>
+        <p>你将扮演其中一位神灵，与其他神话体系的英雄们一决高下，证明你所在体系的至高无上。</p>
+        <p>选择你的英雄，运用策略和智慧，成为最终的胜利者！</p>
+      </div>
+      
+      <!-- 音频元素 -->
+      <audio id="backgroundAudio" loop>
+        <source src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAD" type="audio/wav">
+      </audio>
+      
+      <script>
+        // 生成粒子效果
+        function createParticles() {
+          const particlesContainer = document.getElementById('particles');
+          const particleCount = 50;
+          
+          for (let i = 0; i < particleCount; i++) {
+            const particle = document.createElement('div');
+            particle.className = 'particle';
+            
+            // 随机位置
+            particle.style.left = Math.random() * 100 + '%';
+            particle.style.animationDelay = Math.random() * 10 + 's';
+            particle.style.animationDuration = (Math.random() * 5 + 5) + 's';
+            
+            particlesContainer.appendChild(particle);
+          }
+        }
+        
+        // 音频控制
+        function initAudio() {
+          const audioControl = document.getElementById('audioControl');
+          const backgroundAudio = document.getElementById('backgroundAudio');
+          
+          // 创建语音旁白
+          if ('speechSynthesis' in window) {
+            const shamanVoice = new SpeechSynthesisUtterance();
+            shamanVoice.text = '欢迎来到神迹对决，勇士。在这里，不同神话体系的神灵们将展开一场史诗般的对决。选择你的英雄，运用策略和智慧，成为最终的胜利者！';
+            shamanVoice.lang = 'zh-CN';
+            shamanVoice.volume = 0.7;
+            shamanVoice.rate = 0.9;
+            shamanVoice.pitch = 0.8;
+            
+            // 播放语音旁白
+            setTimeout(() => {
+              speechSynthesis.speak(shamanVoice);
+            }, 1000);
+          }
+          
+          // 音频控制
+          audioControl.addEventListener('click', function() {
+            if ('speechSynthesis' in window) {
+              if (speechSynthesis.speaking) {
+                speechSynthesis.pause();
+                audioControl.classList.add('muted');
+              } else {
+                speechSynthesis.resume();
+                audioControl.classList.remove('muted');
+              }
+            }
+          });
+        }
+        
+        // 页面加载完成后初始化
+        window.addEventListener('load', function() {
+          createParticles();
+          initAudio();
+        });
+      </script>
+    </body>
+  </html>
+  `;
+}
+
+app.get("/", async (req, res) => {
+  if (!requireConfig(res)) return;
   const { session } = await getSessionFromRequest(req);
-  if (!session?.token?.accessToken) {
-    res.status(401).json({ ok: false, error: "unauthorized" });
+  if (!session?.user || !session?.token?.accessToken) {
+    res.send(renderLoginPage());
     return;
   }
-  const friendId = String(req.body?.friendId || "");
-  if (!friendId) {
-    res.status(400).json({ ok: false, error: "missing_friend_id" });
-    return;
-  }
-
-  const accessToken = session.token.accessToken;
-  const candidates = [
-    `${SECONDME_API_BASE_URL}/api/secondme/friend/invite`,
-    `${SECONDME_API_BASE_URL}/api/secondme/friends/invite`,
-  ];
-
-  for (const url of candidates) {
-    try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ friendId }),
-      });
-      const json = await resp.json().catch(() => null);
-      if (resp.ok && json && json.code === 0) {
-        res.json({ ok: true });
-        return;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  res.status(502).json({ ok: false, error: "invite_endpoint_unavailable" });
+  res.send(renderPage({ isLoggedIn: true, user: session.user, rankProgress: session.rankProgress }));
 });
+
+
 
 app.post("/api/ranked/result", async (req, res) => {
   const { sid, session } = await getOrCreateSession(req, res);
@@ -3615,6 +6265,8 @@ app.post("/api/ranked/result", async (req, res) => {
   });
 });
 
+
+
 app.get("/api/healthz", (req, res) => {
   res.json({
     ok: true,
@@ -3633,6 +6285,17 @@ app.get("/api/integration/tools", (req, res) => {
   res.json({
     ok: true,
     tools: getIntegrationTools(getAppBaseUrl(req)),
+  });
+});
+
+app.get("/api/mcp", (req, res) => {
+  const baseUrl = getAppBaseUrl(req);
+  res.json({
+    ok: true,
+    endpoint: `${baseUrl}/api/mcp`,
+    transport: "JSON-RPC over HTTP",
+    message: "MCP endpoint is alive. Use POST /api/mcp with a JSON-RPC body.",
+    supportedMethods: ["initialize", "notifications/initialized", "ping", "tools/list", "tools/call"],
   });
 });
 
