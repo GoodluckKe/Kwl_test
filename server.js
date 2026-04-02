@@ -2,8 +2,18 @@ import express from "express";
 import dotenv from "dotenv";
 import fs from "fs";
 import crypto from "crypto";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
+
+// 检查是否在 Vercel 环境中
+const isVercel = process.env.VERCEL === '1';
+
+// 在 Vercel 环境中不导入 sqlite3
+let sqlite3 = null;
+let open = null;
+if (!isVercel) {
+  sqlite3 = require("sqlite3");
+  const sqliteModule = require("sqlite");
+  open = sqliteModule.open;
+}
 
 if (fs.existsSync(".env.local")) {
   dotenv.config({ path: ".env.local" });
