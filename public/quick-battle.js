@@ -21,6 +21,42 @@
     7: ["lord", "loyalist", "loyalist", "rebel", "rebel", "rebel", "spy"],
     8: ["lord", "loyalist", "loyalist", "rebel", "rebel", "rebel", "rebel", "spy"],
   };
+  const SEAT_POSITION_PRESET = {
+    5: [
+      { left: 50, top: 80 },
+      { left: 24, top: 64 },
+      { left: 29, top: 31 },
+      { left: 71, top: 31 },
+      { left: 76, top: 64 },
+    ],
+    6: [
+      { left: 50, top: 80 },
+      { left: 22, top: 67 },
+      { left: 22, top: 41 },
+      { left: 50, top: 24 },
+      { left: 78, top: 41 },
+      { left: 78, top: 67 },
+    ],
+    7: [
+      { left: 50, top: 82 },
+      { left: 25, top: 72 },
+      { left: 17, top: 51 },
+      { left: 28, top: 30 },
+      { left: 72, top: 30 },
+      { left: 83, top: 51 },
+      { left: 75, top: 72 },
+    ],
+    8: [
+      { left: 50, top: 84 },
+      { left: 28, top: 76 },
+      { left: 16, top: 57 },
+      { left: 26, top: 34 },
+      { left: 50, top: 22 },
+      { left: 74, top: 34 },
+      { left: 84, top: 57 },
+      { left: 72, top: 76 },
+    ],
+  };
   const ACTIONABLE_DELAYED = new Set(["潘多拉魔盒", "斯芬克斯之谜", "世界树之缚"]);
   const SINGLE_TARGET = new Set(["神击", "灵药", "天罚", "神谕", "命运纺锤", "雷霆之怒", "潘多拉魔盒", "斯芬克斯之谜", "世界树之缚"]);
   const REACTION_ONLY = new Set(["神盾", "神之恩典"]);
@@ -109,6 +145,38 @@
     resultKicker: document.getElementById("qbResultKicker"),
     resultRestartBtn: document.getElementById("qbResultRestart"),
   };
+
+  function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function readArenaSize() {
+    const rect = refs.arena && typeof refs.arena.getBoundingClientRect === "function"
+      ? refs.arena.getBoundingClientRect()
+      : null;
+    return {
+      width: Math.max(320, Number(rect?.width) || Number(window.innerWidth) || 1280),
+      height: Math.max(260, Number(rect?.height) || Number(window.innerHeight) || 720),
+    };
+  }
+
+  function applySeatSizing(totalSeats) {
+    const count = normalizePlayerCount(totalSeats);
+    const { width, height } = readArenaSize();
+    const countOffset = count >= 8 ? -22 : count === 7 ? -18 : count === 6 ? -10 : -4;
+    const widthOffset = width < 860 ? -16 : width < 1040 ? -12 : width < 1220 ? -6 : 0;
+    const heightOffset = height < 470 ? -14 : height < 610 ? -9 : height < 700 ? -4 : 0;
+    const seatSize = clampNumber(110 + countOffset + widthOffset + heightOffset, 68, 118);
+    const selfScale = count >= 7 ? 1.18 : 1.25;
+    const selfSize = clampNumber(Math.round(seatSize * selfScale), 86, 148);
+    const avatarSize = clampNumber(Math.round(seatSize * 0.34), 28, 40);
+    const selfAvatarSize = clampNumber(Math.round(selfSize * 0.33), 34, 50);
+    const rootStyle = document.documentElement.style;
+    rootStyle.setProperty("--qb-seat-size", `${seatSize}px`);
+    rootStyle.setProperty("--qb-seat-self-size", `${selfSize}px`);
+    rootStyle.setProperty("--qb-seat-avatar-size", `${avatarSize}px`);
+    rootStyle.setProperty("--qb-seat-avatar-self-size", `${selfAvatarSize}px`);
+  }
 
   function shuffle(list) {
     const array = [...list];
@@ -220,13 +288,27 @@
 
   function seatPositionFor(seat, totalSeats) {
     const count = normalizePlayerCount(totalSeats);
-    const radius = count >= 8 ? 38 : count <= 5 ? 32 : 35;
-    const angle = Math.PI / 2 + (2 * Math.PI * (Number(seat) % count)) / count;
-    const left = 50 + radius * Math.cos(angle);
-    const top = 49 + radius * Math.sin(angle);
+    const safeSeat = Number.isFinite(Number(seat)) ? ((Number(seat) % count) + count) % count : 0;
+    const { width, height } = readArenaSize();
+    const xScale = width < 860 ? 0.88 : width < 1080 ? 0.94 : 1;
+    const yScale = height < 500 ? 0.85 : height < 640 ? 0.92 : 1;
+    const preset = SEAT_POSITION_PRESET[count] && SEAT_POSITION_PRESET[count][safeSeat];
+    if (preset) {
+      const left = 50 + (preset.left - 50) * xScale;
+      const top = 50 + (preset.top - 50) * yScale;
+      return {
+        left: clampNumber(left, 10, 90),
+        top: clampNumber(top, 14, 86),
+      };
+    }
+    const radiusX = count >= 8 ? 31 : count <= 5 ? 25 : 28;
+    const radiusY = count >= 8 ? 30 : count <= 5 ? 24 : 27;
+    const angle = Math.PI / 2 + (2 * Math.PI * safeSeat) / count;
+    const left = 50 + radiusX * Math.cos(angle) * xScale;
+    const top = 50 + radiusY * Math.sin(angle) * yScale;
     return {
-      left: Math.max(8, Math.min(92, left)),
-      top: Math.max(12, Math.min(86, top)),
+      left: clampNumber(left, 10, 90),
+      top: clampNumber(top, 14, 86),
     };
   }
 
@@ -1319,8 +1401,11 @@
     const human = getPlayerById(state.humanPlayerId);
     const card = selectedCard();
     const validTargets = human && card ? validTargetsForCard(human, card) : [];
+    const seatCount = normalizePlayerCount(state.seatCount || state.players.length);
+    applySeatSizing(seatCount);
+    refs.arena.dataset.seatCount = String(seatCount);
     refs.arena.innerHTML = state.players.map((player) => {
-      const pos = seatPositionFor(player.seat, state.seatCount || state.players.length);
+      const pos = seatPositionFor(player.seat, seatCount);
       const classes = [
         "qb-seat",
         player.isHuman ? "self" : "",
@@ -1413,7 +1498,7 @@
     refs.resultCamp.textContent = `${state.gameOver.camp}胜利`;
     if (modeConfig.rankEnabled && state.rankUpdate?.rank) {
       const sign = state.rankUpdate.delta > 0 ? "+" : "";
-      refs.resultText.textContent = `${state.gameOver.text} 排位经验 ${sign}${state.rankUpdate.delta}，当前段位：${state.rankUpdate.rank.display}（${state.rankUpdate.rank.progress}/${state.rankUpdate.rank.progressMax}）。`;
+      refs.resultText.textContent = `${state.gameOver.text} 排位积分 ${sign}${state.rankUpdate.delta}，当前段位：${state.rankUpdate.rank.display}（${state.rankUpdate.rank.progress}/${state.rankUpdate.rank.progressMax}）。`;
     } else {
       refs.resultText.textContent = state.gameOver.text;
     }
@@ -1502,6 +1587,13 @@
   }
 
   function bindEvents() {
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        renderAll();
+      }, 120);
+    });
     document.addEventListener("click", (event) => {
       const cardEl = event.target.closest("[data-card-uid]");
       if (cardEl) {

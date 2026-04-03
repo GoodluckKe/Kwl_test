@@ -112,7 +112,6 @@ async function initDatabase() {
 
 // 初始化数据库
 initDatabase();
-const RANK_PHASES = ["前期", "中期", "后期"];
 const RANK_STEP_EXP = 100;
 const RANK_GAIN_WIN = 20;
 const RANK_GAIN_LOSS = -10;
@@ -124,17 +123,20 @@ const SECONDME_MATCH_CHAT_KEY_PREFIX = "match_chat_";
 const MATCH_CHAT_MAX_MESSAGES = 120;
 const MATCH_CHAT_SYNC_INTERVAL_MS = 5000;
 const MATCH_CHAT_RANDOM_SPEAK_INTERVAL_MS = 8000;
-const RANK_TIERS = [
-  { name: "凡尘行者", title: "初入神迹" },
-  { name: "山海游侠", title: "行过四海" },
-  { name: "昆仑修士", title: "问道神山" },
-  { name: "蓬莱方士", title: "得见仙洲" },
-  { name: "瑶池仙官", title: "侍立天阙" },
-  { name: "龙宫战将", title: "镇守四渎" },
-  { name: "扶桑神裔", title: "执光巡天" },
-  { name: "玄都真君", title: "总摄仙班" },
-  { name: "天门帝尊", title: "执掌神权" },
-  { name: "凌霄神主", title: "问鼎诸天" },
+const LOL_RANK_DIVISIONS = ["IV", "III", "II", "I"];
+const LOL_RANK_TIERS_WITH_DIVISIONS = [
+  { name: "坚韧黑铁", title: "从基础开始，稳住每一回合节奏。" },
+  { name: "英勇黄铜", title: "开始理解身份博弈与资源交换。" },
+  { name: "不屈白银", title: "学会判断战场信息与回合价值。" },
+  { name: "荣耀黄金", title: "进入熟练区间，攻防选择更关键。" },
+  { name: "华贵铂金", title: "细节运营决定胜率，容错开始下降。" },
+  { name: "流光翡翠", title: "协同与反制并重，局势转折更频繁。" },
+  { name: "璀璨钻石", title: "高强度对局，任何失误都可能被放大。" },
+];
+const LOL_RANK_APEX_TIERS = [
+  { name: "超凡大师", title: "突破钻石门槛，进入顶尖竞争。" },
+  { name: "傲世宗师", title: "全服强者行列，博弈强度持续拉满。" },
+  { name: "最强王者", title: "英雄联盟式巅峰段位，向更高积分冲刺。" },
 ];
 const GUIDE_BEGINNER_HERO_IDS = ["华夏-大禹", "奥林匹斯-雅典娜", "凯美特-拉"];
 const GUIDE_CARD_NAMES = ["神击", "神盾", "灵药", "天罚", "雷霆之怒", "神之恩典"];
@@ -374,26 +376,78 @@ function createRankProgress(score = RANK_INITIAL_EXP) {
 }
 
 function getRankMeta(scoreInput = 0) {
-  const totalStages = RANK_TIERS.length * RANK_PHASES.length;
-  const maxScore = totalStages * RANK_STEP_EXP - 1;
-  const safeScore = Math.max(0, Math.min(maxScore, Math.floor(Number(scoreInput) || 0)));
-  const stageIndex = Math.floor(safeScore / RANK_STEP_EXP);
-  const tierIndex = Math.min(RANK_TIERS.length - 1, Math.floor(stageIndex / RANK_PHASES.length));
-  const phaseIndex = stageIndex % RANK_PHASES.length;
-  const tier = RANK_TIERS[tierIndex];
-  const progress = safeScore % RANK_STEP_EXP;
-  const isMax = stageIndex >= totalStages - 1 && progress >= RANK_STEP_EXP - 1;
+  const safeScore = Math.max(0, Math.floor(Number(scoreInput) || 0));
+  const baseTierCount = LOL_RANK_TIERS_WITH_DIVISIONS.length;
+  const baseStageCount = baseTierCount * LOL_RANK_DIVISIONS.length;
+  const baseScoreCap = baseStageCount * RANK_STEP_EXP;
+  const masterStartScore = baseScoreCap;
+  const grandmasterStartScore = masterStartScore + RANK_STEP_EXP;
+  const challengerStartScore = grandmasterStartScore + RANK_STEP_EXP;
+
+  let tierIndex = 0;
+  let phaseIndex = 0;
+  let tierName = "";
+  let tierTitle = "";
+  let phaseLabel = "";
+  let display = "";
+  let shortDisplay = "";
+  let progress = 0;
+  let progressMax = RANK_STEP_EXP;
+  let isMax = false;
+
+  if (safeScore < baseScoreCap) {
+    const stageIndex = Math.floor(safeScore / RANK_STEP_EXP);
+    tierIndex = Math.min(baseTierCount - 1, Math.floor(stageIndex / LOL_RANK_DIVISIONS.length));
+    phaseIndex = stageIndex % LOL_RANK_DIVISIONS.length;
+    const tier = LOL_RANK_TIERS_WITH_DIVISIONS[tierIndex];
+    phaseLabel = LOL_RANK_DIVISIONS[phaseIndex];
+    tierName = tier.name;
+    tierTitle = tier.title;
+    progress = safeScore % RANK_STEP_EXP;
+    display = `${tier.name} ${phaseLabel}`;
+    shortDisplay = `${tier.name}${phaseLabel}`;
+  } else if (safeScore < grandmasterStartScore) {
+    const tier = LOL_RANK_APEX_TIERS[0];
+    tierIndex = baseTierCount;
+    phaseIndex = -1;
+    tierName = tier.name;
+    tierTitle = tier.title;
+    progress = safeScore - masterStartScore;
+    display = `${tier.name} ${progress} LP`;
+    shortDisplay = tier.name;
+  } else if (safeScore < challengerStartScore) {
+    const tier = LOL_RANK_APEX_TIERS[1];
+    tierIndex = baseTierCount + 1;
+    phaseIndex = -1;
+    tierName = tier.name;
+    tierTitle = tier.title;
+    progress = safeScore - grandmasterStartScore;
+    display = `${tier.name} ${progress} LP`;
+    shortDisplay = tier.name;
+  } else {
+    const tier = LOL_RANK_APEX_TIERS[2];
+    tierIndex = baseTierCount + 2;
+    phaseIndex = -1;
+    tierName = tier.name;
+    tierTitle = tier.title;
+    phaseLabel = "巅峰";
+    progress = safeScore - challengerStartScore;
+    progressMax = Math.max(RANK_STEP_EXP, Math.ceil((progress + 1) / RANK_STEP_EXP) * RANK_STEP_EXP);
+    display = `${tier.name} ${progress} LP`;
+    shortDisplay = tier.name;
+  }
+
   return {
     score: safeScore,
     tierIndex,
     phaseIndex,
-    tierName: tier.name,
-    tierTitle: tier.title,
-    phaseLabel: RANK_PHASES[phaseIndex],
-    display: `${tier.name} · ${RANK_PHASES[phaseIndex]}`,
-    shortDisplay: `${tier.name}${RANK_PHASES[phaseIndex]}`,
+    tierName,
+    tierTitle,
+    phaseLabel,
+    display,
+    shortDisplay,
     progress,
-    progressMax: RANK_STEP_EXP,
+    progressMax,
     isMax,
     gainWin: RANK_GAIN_WIN,
     losePenalty: Math.abs(RANK_GAIN_LOSS),
@@ -2251,7 +2305,7 @@ function getBattleModeMeta(mode) {
       key: "ranked",
       label: "排位赛",
       drawPhaseCount: 2,
-      intro: "在排位赛中累积神迹经验，推进你的中国神话段位。",
+      intro: "在排位赛中累积 LP，按 LoL 段位体系持续晋升。",
       rankEnabled: true,
     };
   }
@@ -2684,6 +2738,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           border:1px solid rgba(251,191,36,.45);background:rgba(8,14,24,.96);
           box-shadow:0 28px 80px rgba(0,0,0,.4);
           display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;gap:14px;
+          position:relative;
         }
         .battle-mode-tag{
           display:inline-flex;align-items:center;justify-content:center;
@@ -2691,6 +2746,8 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           border:1px solid rgba(251,191,36,.35);background:rgba(245,158,11,.12);
           color:#fde68a;font-weight:800;font-size:12px;letter-spacing:.8px;
         }
+        .battle-modal-copy{position:relative;padding-right:0}
+        .battle-modal-box.ranked-active .battle-modal-copy{padding-right:min(36vw,360px)}
         .battle-modal-copy h3{margin:10px 0 6px;font-size:32px}
         .battle-modal-copy p{margin:0;color:#b7cdee;line-height:1.6}
         .battle-player-count{
@@ -2720,17 +2777,23 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         }
         .battle-rank-panel{
           display:none;
-          grid-template-columns:repeat(3,minmax(0,1fr));
-          gap:12px;
+          position:absolute;
+          top:84px;
+          right:18px;
+          width:min(340px,calc(100% - 36px));
+          z-index:1;
         }
-        .battle-rank-panel.show{display:grid}
+        .battle-rank-panel.show{display:block}
         .battle-rank-card{
-          border:1px solid rgba(125,211,252,.18);
-          border-radius:14px;padding:12px;background:rgba(10,18,31,.72);
+          border:1px solid rgba(125,211,252,.28);
+          border-radius:14px;
+          padding:12px 14px;
+          background:linear-gradient(135deg, rgba(10,18,31,.92), rgba(22,32,49,.9));
+          box-shadow:0 16px 36px rgba(2,8,18,.45), 0 0 0 1px rgba(186,230,253,.08) inset;
         }
         .battle-rank-card span{display:block;font-size:11px;color:#9ec0e7;margin-bottom:6px}
-        .battle-rank-card strong{display:block;font-size:16px;color:#fff}
-        .battle-rank-card em{display:block;margin-top:6px;font-size:12px;color:#dbeafe;font-style:normal}
+        .battle-rank-card strong{display:block;font-size:22px;color:#fff}
+        .battle-rank-card em{display:block;margin-top:8px;font-size:12px;color:#dbeafe;font-style:normal;line-height:1.55}
         .battle-selection-layout{
           min-height:0;
           display:grid;grid-template-columns:minmax(0,1.35fr) 320px;gap:14px;
@@ -2931,7 +2994,9 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           .hero-modal-top{flex-direction:column}
           .hero-modal-top img{width:min(200px,100%);height:auto;aspect-ratio:1/1}
           .battle-modal-box{max-height:92vh;grid-template-rows:auto auto minmax(0,1fr) auto}
-          .battle-rank-panel{grid-template-columns:1fr}
+          .battle-modal-box.ranked-active .battle-modal-copy{padding-right:0}
+          .battle-rank-panel{position:static;width:100%}
+          .battle-rank-panel.show{display:block}
           .battle-selection-layout{grid-template-columns:1fr}
           .battle-preview{order:-1;max-height:38vh;overflow:auto}
           .battle-modal-actions{flex-direction:column;align-items:stretch}
@@ -3126,7 +3191,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         ${isLoggedIn ? `<div class="login-state" id="loginState">SecondMe 登录成功</div>` : ""}
         <div class="mode-row">
           <button class="mode-btn active" data-mode="quick"><span class="mode-btn-label">快速战斗</span><span class="mode-btn-sub">支持 5/6/7/8 人场，身份规则不变</span></button>
-          <button class="mode-btn" data-mode="ranked"><span class="mode-btn-label">排位赛</span><span class="mode-btn-sub">获取神话段位经验，稳定上分</span></button>
+          <button class="mode-btn" data-mode="ranked"><span class="mode-btn-label">排位赛</span><span class="mode-btn-sub">LoL 段位体系，支持 5/6/7/8 人场</span></button>
           <button class="mode-btn" data-mode="slaughter"><span class="mode-btn-label">杀戮模式</span><span class="mode-btn-sub">高资源高爆发，适合爽局与压制</span></button>
           <button class="mode-btn" data-mode="tutorial"><span class="mode-btn-label">新手教学</span><span class="mode-btn-sub">从身份、卡牌到实战决策一步看懂</span></button>
         </div>
@@ -3187,7 +3252,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
             <h3>选择你的英雄</h3>
             <p id="battleModeIntro">先选择人数，再锁定一位神明进入战场。</p>
             <div class="battle-player-count" id="battlePlayerCountWrap" hidden>
-              <span class="battle-player-count-label">快速战斗人数</span>
+              <span class="battle-player-count-label">对局人数</span>
               <div class="battle-player-count-list" id="battlePlayerCountList">
                 <button class="battle-count-btn" type="button" data-battle-count="5">5人场</button>
                 <button class="battle-count-btn" type="button" data-battle-count="6">6人场</button>
@@ -3238,6 +3303,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         const cardModalClose = document.getElementById("cardModalClose");
 
         const battleModal = document.getElementById("battleModal");
+        const battleModalBox = battleModal ? battleModal.querySelector(".battle-modal-box") : null;
         const battleModalClose = document.getElementById("battleModalClose");
         const battleModeTag = document.getElementById("battleModeTag");
         const battleModeIntro = document.getElementById("battleModeIntro");
@@ -3275,6 +3341,12 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           7: "标准七人局，身份对抗最经典，节奏与信息量最稳定。",
           8: "八人局战线更长，运营与拉扯空间更大，后期更刺激。",
         };
+        const RANKED_BATTLE_COUNT_INTRO = {
+          5: "5 人排位节奏极快，容错更低，适合冲分提速。",
+          6: "6 人排位更平衡，协作与拆解同时重要。",
+          7: "7 人排位信息量最完整，适合稳定上分。",
+          8: "8 人排位运营更长线，后期博弈更考验决策。",
+        };
         function normalizeBattleCount(count) {
           const n = Number(count);
           return [5, 6, 7, 8].includes(n) ? n : 7;
@@ -3288,7 +3360,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           },
           ranked: {
             label: "排位赛",
-            intro: "先确认你的当前段位，再选择英雄进入排位对局。",
+            intro: "先选择 5/6/7/8 人场，再锁定英雄进入排位对局。",
             path: "/battle/ranked",
             ranked: true
           },
@@ -3321,6 +3393,9 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         function renderRankPanel(mode) {
           if (!battleRankPanel) return;
           const meta = battleModes[mode] || battleModes.quick;
+          if (battleModalBox) {
+            battleModalBox.classList.toggle("ranked-active", Boolean(meta.ranked));
+          }
           if (!meta.ranked) {
             battleRankPanel.classList.remove("show");
             battleRankPanel.innerHTML = "";
@@ -3328,16 +3403,17 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           }
           battleRankPanel.classList.add("show");
           battleRankPanel.innerHTML =
-            '<div class="battle-rank-card"><span>当前段位</span><strong>' + (rankData.display || "凡尘行者 · 前期") + '</strong><em>' + (rankData.tierTitle || "初入神迹") + '</em></div>' +
-            '<div class="battle-rank-card"><span>当前经验</span><strong>' + ((rankData.progress || 0) + " / " + (rankData.progressMax || 100)) + '</strong><em>每一级固定需要 100 经验</em></div>' +
-            '<div class="battle-rank-card"><span>排位结算</span><strong>胜利 +20 / 失败 -10</strong><em>只有排位赛会结算经验</em></div>';
+            '<div class="battle-rank-card"><span>当前段位</span><strong>' + (rankData.display || "坚韧黑铁 IV") + '</strong><em>' +
+            '当前积分：' + ((rankData.progress || 0) + " / " + (rankData.progressMax || 100)) + '（LP）<br/>' +
+            '结算规则：胜利 +20 / 失败 -10' +
+            '</em></div>';
         }
         function renderQuickBattleCountPicker(mode) {
-          const isQuick = mode === "quick";
+          const supportsCount = mode === "quick" || mode === "ranked";
           if (battlePlayerCountWrap) {
-            battlePlayerCountWrap.hidden = !isQuick;
+            battlePlayerCountWrap.hidden = !supportsCount;
           }
-          if (!isQuick) return;
+          if (!supportsCount) return;
           selectedBattlePlayerCount = normalizeBattleCount(selectedBattlePlayerCount);
           if (battlePlayerCountList) {
             const countButtons = Array.from(battlePlayerCountList.querySelectorAll("[data-battle-count]"));
@@ -3354,8 +3430,9 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           const meta = battleModes[mode] || battleModes.quick;
           if (battleModeTag) battleModeTag.textContent = meta.label;
           if (battleModeIntro) {
-            if (mode === "quick") {
-              const intro = QUICK_BATTLE_COUNT_INTRO[selectedBattlePlayerCount] || meta.intro;
+            if (mode === "quick" || mode === "ranked") {
+              const introMap = mode === "ranked" ? RANKED_BATTLE_COUNT_INTRO : QUICK_BATTLE_COUNT_INTRO;
+              const intro = introMap[selectedBattlePlayerCount] || meta.intro;
               battleModeIntro.textContent = intro;
             } else {
               battleModeIntro.textContent = meta.intro;
@@ -3396,7 +3473,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           const meta = battleModes[mode] || battleModes.quick;
           pendingBattleMode = mode;
           selectedBattleHeroId = "";
-          if (mode === "quick") {
+          if (mode === "quick" || mode === "ranked") {
             selectedBattlePlayerCount = 7;
           }
           renderBattleModeCopy(mode);
@@ -3429,7 +3506,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
             const target = event.target.closest("[data-battle-count]");
             if (!target) return;
             selectedBattlePlayerCount = normalizeBattleCount(target.dataset.battleCount);
-            renderBattleModeCopy("quick");
+            renderBattleModeCopy(pendingBattleMode);
           });
         }
         if (battleHeroList) {
@@ -3446,7 +3523,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
             const meta = battleModes[pendingBattleMode] || battleModes.quick;
             if (!selectedBattleHeroId) return;
             let nextUrl = meta.path + "?hero=" + encodeURIComponent(selectedBattleHeroId);
-            if (pendingBattleMode === "quick") {
+            if (pendingBattleMode === "quick" || pendingBattleMode === "ranked") {
               nextUrl += "&players=" + encodeURIComponent(String(normalizeBattleCount(selectedBattlePlayerCount)));
             }
             window.location.href = nextUrl;
@@ -4535,14 +4612,13 @@ function renderQuickBattlePage(user, options = {}) {
       <div class="qb-page">
         <header class="qb-header">
           <a class="qb-back" href="/game">返回大厅</a>
-          <div class="qb-title"></div>
-          <div style="display: flex; align-items: center; gap: 12px;">
-            <div id="qbTurnTimer" style="display: none; min-width: 36px; height: 36px; padding: 0 10px; background: rgba(251, 191, 36, 0.15); border: 1px solid rgba(251, 191, 36, 0.4); border-radius: 18px; color: #fbbf24; font-size: 16px; font-weight: bold; line-height: 34px; text-align: center;">20</div>
-            <div class="qb-footer-actions" style="justify-content:flex-end;">
-              <button class="qb-ghost" id="qbRestart" type="button">重新开局</button>
-              <button class="qb-ghost" id="qbChatToggle" type="button">聊天</button>
-              <button class="qb-ghost" id="qbVoiceToggle" type="button">语音</button>
-            </div>
+          <div class="qb-title">
+            <div id="qbTurnTimer" class="qb-turn-timer">20</div>
+          </div>
+          <div class="qb-footer-actions">
+            <button class="qb-ghost" id="qbRestart" type="button">重新开局</button>
+            <button class="qb-ghost" id="qbChatToggle" type="button">聊天</button>
+            <button class="qb-ghost" id="qbVoiceToggle" type="button">语音</button>
           </div>
         </header>
 
@@ -4710,13 +4786,28 @@ const activeMatches = new Map();
 const matchChats = new Map();
 const userMatchTimers = new Map();
 const matchQueuePlayerCounts = new Map();
+const matchQueueModes = new Map();
 const matchChatLastSyncedAt = new Map();
 const matchChatLastAmbientAt = new Map();
+const SUPPORTED_MATCH_MODES = new Set(["quick", "ranked", "slaughter", "manual"]);
 
 function normalizeBattlePlayerCount(value) {
   const numeric = Number(value);
   if (SUPPORTED_BATTLE_PLAYER_COUNTS.includes(numeric)) return numeric;
   return DEFAULT_BATTLE_PLAYER_COUNT;
+}
+
+function normalizeMatchMode(mode) {
+  const normalized = String(mode || "").toLowerCase();
+  if (SUPPORTED_MATCH_MODES.has(normalized)) return normalized;
+  return "quick";
+}
+
+function clearMatchState(matchId) {
+  activeMatches.delete(matchId);
+  matchChats.delete(matchId);
+  matchChatLastSyncedAt.delete(matchId);
+  matchChatLastAmbientAt.delete(matchId);
 }
 
 const MATCH_CHAT_REPLY_TEMPLATES = [
@@ -5058,29 +5149,33 @@ app.post("/api/match/join", async (req, res) => {
   const userName = session.user.name;
   const userAvatar = session.user.avatar;
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  const mode = normalizeMatchMode(body.mode);
   const targetPlayerCount = normalizeBattlePlayerCount(body.playerCount);
   const selectedHeroId = String(body.hero || "");
   
   // 检查是否已经在队列中
   if (matchQueue.has(userId)) {
-    matchQueuePlayerCounts.set(userId, targetPlayerCount);
-    res.json({ ok: true, status: "waiting", playerCount: targetPlayerCount });
+    const queuedMode = normalizeMatchMode(matchQueueModes.get(userId));
+    const queuedCount = normalizeBattlePlayerCount(matchQueuePlayerCounts.get(userId));
+    if (queuedMode !== mode || queuedCount !== targetPlayerCount) {
+      matchQueueModes.set(userId, mode);
+      matchQueuePlayerCounts.set(userId, targetPlayerCount);
+    }
+    res.json({ ok: true, status: "waiting", mode, playerCount: targetPlayerCount });
     return;
   }
   
   // 检查是否已经在匹配中
   for (const [matchId, match] of activeMatches.entries()) {
-    if (match.players.some(p => p.id === userId)) {
+    if (match.players.some((p) => String(p.id) === String(userId))) {
       const existingCount = normalizeBattlePlayerCount(match.playerCount || match.players.length);
-      if (existingCount === targetPlayerCount) {
-        res.json({ ok: true, status: "matched", matchId, playerCount: existingCount });
+      const existingMode = normalizeMatchMode(match.mode);
+      if (existingMode === mode && existingCount === targetPlayerCount) {
+        res.json({ ok: true, status: "matched", matchId, mode, playerCount: existingCount });
         return;
       }
-      // 目标人数变化时，不复用旧对局，直接丢弃并创建新对局
-      activeMatches.delete(matchId);
-      matchChats.delete(matchId);
-      matchChatLastSyncedAt.delete(matchId);
-      matchChatLastAmbientAt.delete(matchId);
+      // 模式或人数变化时，不复用旧对局，直接丢弃并创建新对局
+      clearMatchState(matchId);
       break;
     }
   }
@@ -5113,7 +5208,7 @@ app.post("/api/match/join", async (req, res) => {
           if (json && json.data && Array.isArray(json.data) && json.data.length > 0) {
             const userIds = new Set();
             json.data.forEach(post => {
-              if (post.author && post.author.id && post.author.id !== userId) {
+              if (post.author && post.author.id && String(post.author.id) !== String(userId)) {
                 userIds.add(post.author.id);
               }
             });
@@ -5142,7 +5237,7 @@ app.post("/api/match/join", async (req, res) => {
     console.log("Plaza API 获取失败，使用预定义推荐用户列表");
     const defaultUserIds = ["2292998", "2158643", "2279094", "2285987", "2234123", "2312342"];
     recommendedUsers = defaultUserIds
-      .filter(id => id !== userId)
+      .filter((id) => String(id) !== String(userId))
       .slice(0, Math.max(1, targetPlayerCount - 1))
       .map(id => ({
         id: id,
@@ -5191,17 +5286,18 @@ app.post("/api/match/join", async (req, res) => {
       createdAt: Date.now(),
       isAI: false,
       playerCount: targetPlayerCount,
+      mode,
     };
     
     activeMatches.set(matchId, match);
     
     // 5分钟后自动清理匹配
     setTimeout(() => {
-      activeMatches.delete(matchId);
+      clearMatchState(matchId);
     }, 5 * 60 * 1000);
     
     console.log("创建匹配成功，使用Discover推荐用户，匹配ID:", matchId);
-    res.json({ ok: true, status: "matched", matchId, players: players, playerCount: targetPlayerCount });
+    res.json({ ok: true, status: "matched", matchId, mode, players: players, playerCount: targetPlayerCount });
     return;
   }
   
@@ -5214,6 +5310,7 @@ app.post("/api/match/join", async (req, res) => {
   // 加入匹配队列
   matchQueue.add(userId);
   matchQueuePlayerCounts.set(userId, targetPlayerCount);
+  matchQueueModes.set(userId, mode);
   
   // 设置10秒匹配时间
   const timer = setTimeout(async () => {
@@ -5222,7 +5319,9 @@ app.post("/api/match/join", async (req, res) => {
       // 匹配超时，生成AI玩家
       matchQueue.delete(userId);
       const queuedPlayerCount = normalizeBattlePlayerCount(matchQueuePlayerCounts.get(userId));
+      const queuedMode = normalizeMatchMode(matchQueueModes.get(userId));
       matchQueuePlayerCounts.delete(userId);
+      matchQueueModes.delete(userId);
       
       // 创建匹配，包含用户和AI玩家
       const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -5235,6 +5334,7 @@ app.post("/api/match/join", async (req, res) => {
             name: userName,
             avatar: userAvatar,
             hero: selectedHeroId,
+            isHuman: true,
           },
           ...aiPlayers
         ],
@@ -5242,13 +5342,14 @@ app.post("/api/match/join", async (req, res) => {
         createdAt: Date.now(),
         isAI: true, // 标记为AI匹配
         playerCount: queuedPlayerCount,
+        mode: queuedMode,
       };
       
       activeMatches.set(matchId, match);
       
       // 5分钟后自动清理匹配
       setTimeout(() => {
-        activeMatches.delete(matchId);
+        clearMatchState(matchId);
       }, 5 * 60 * 1000);
       
       // 通知用户匹配成功（AI）
@@ -5262,7 +5363,8 @@ app.post("/api/match/join", async (req, res) => {
   const sameCountQueuedUsers = [];
   for (const id of matchQueue) {
     const queueCount = normalizeBattlePlayerCount(matchQueuePlayerCounts.get(id));
-    if (queueCount === targetPlayerCount) {
+    const queueMode = normalizeMatchMode(matchQueueModes.get(id));
+    if (queueCount === targetPlayerCount && queueMode === mode) {
       sameCountQueuedUsers.push(id);
       if (sameCountQueuedUsers.length === 2) break;
     }
@@ -5280,6 +5382,7 @@ app.post("/api/match/join", async (req, res) => {
         userMatchTimers.delete(id);
       }
       matchQueuePlayerCounts.delete(id);
+      matchQueueModes.delete(id);
     }
     
     // 创建匹配
@@ -5288,7 +5391,7 @@ app.post("/api/match/join", async (req, res) => {
       id,
       name: String(id) === String(userId) ? userName : `SecondMe玩家${String(id).slice(-4)}`,
       avatar: String(id) === String(userId) ? userAvatar : "/assets/bg-myth-war.png",
-      hero: "",
+      hero: String(id) === String(userId) ? selectedHeroId : "",
       isHuman: String(id) === String(userId),
     }));
     if (players.length < targetPlayerCount) {
@@ -5301,18 +5404,19 @@ app.post("/api/match/join", async (req, res) => {
       createdAt: Date.now(),
       isAI: false, // 标记为真实玩家匹配
       playerCount: targetPlayerCount,
+      mode,
     };
     
     activeMatches.set(matchId, match);
     
     // 5分钟后自动清理匹配
     setTimeout(() => {
-      activeMatches.delete(matchId);
+      clearMatchState(matchId);
     }, 5 * 60 * 1000);
     
-    res.json({ ok: true, status: "matched", matchId, playerCount: targetPlayerCount });
+    res.json({ ok: true, status: "matched", matchId, mode, playerCount: targetPlayerCount });
   } else {
-    res.json({ ok: true, status: "waiting", playerCount: targetPlayerCount });
+    res.json({ ok: true, status: "waiting", mode, playerCount: targetPlayerCount });
   }
 });
 
@@ -5328,6 +5432,7 @@ app.post("/api/match/manual", async (req, res) => {
   const userName = session.user.name;
   const userAvatar = session.user.avatar;
   const { playerIds } = req.body;
+  const mode = normalizeMatchMode(req.body?.mode || "manual");
   const targetPlayerCount = normalizeBattlePlayerCount(req.body?.playerCount);
   
   if (!Array.isArray(playerIds)) {
@@ -5336,7 +5441,7 @@ app.post("/api/match/manual", async (req, res) => {
   }
   
   // 过滤掉自己
-  const otherPlayerIds = playerIds.filter(id => id !== userId);
+  const otherPlayerIds = playerIds.filter((id) => String(id) !== String(userId));
   
   // 创建匹配
   const matchId = `match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -5374,16 +5479,17 @@ app.post("/api/match/manual", async (req, res) => {
     createdAt: Date.now(),
     isAI: false, // 标记为真实玩家匹配
     playerCount: targetPlayerCount,
+    mode,
   };
   
   activeMatches.set(matchId, match);
   
   // 5分钟后自动清理匹配
   setTimeout(() => {
-    activeMatches.delete(matchId);
+    clearMatchState(matchId);
   }, 5 * 60 * 1000);
   
-  res.json({ ok: true, status: "matched", matchId, playerCount: targetPlayerCount });
+  res.json({ ok: true, status: "matched", matchId, mode, playerCount: targetPlayerCount });
 });
 
 app.post("/api/match/leave", async (req, res) => {
@@ -5396,6 +5502,7 @@ app.post("/api/match/leave", async (req, res) => {
   const userId = session.user.id;
   matchQueue.delete(userId);
   matchQueuePlayerCounts.delete(userId);
+  matchQueueModes.delete(userId);
   
   // 清除定时器
   if (userMatchTimers.has(userId)) {
@@ -5405,8 +5512,8 @@ app.post("/api/match/leave", async (req, res) => {
   
   // 从活跃匹配中移除
   for (const [matchId, match] of activeMatches.entries()) {
-    if (match.players.some(p => p.id === userId)) {
-      activeMatches.delete(matchId);
+    if (match.players.some((p) => String(p.id) === String(userId))) {
+      clearMatchState(matchId);
       break;
     }
   }
@@ -5422,22 +5529,32 @@ app.get("/api/match/status", async (req, res) => {
   }
   
   const userId = session.user.id;
+  const mode = normalizeMatchMode(req.query.mode);
+  const targetPlayerCount = normalizeBattlePlayerCount(req.query.players);
   
   // 检查是否在队列中
   if (matchQueue.has(userId)) {
-    res.json({ ok: true, status: "waiting", playerCount: normalizeBattlePlayerCount(matchQueuePlayerCounts.get(userId)) });
-    return;
-  }
-  
-  // 检查是否在活跃匹配中
-  for (const [matchId, match] of activeMatches.entries()) {
-    if (match.players.some(p => p.id === userId)) {
-      res.json({ ok: true, status: "matched", matchId, match, playerCount: normalizeBattlePlayerCount(match.playerCount) });
+    const queuedMode = normalizeMatchMode(matchQueueModes.get(userId));
+    const queuedCount = normalizeBattlePlayerCount(matchQueuePlayerCounts.get(userId));
+    if (queuedMode === mode && queuedCount === targetPlayerCount) {
+      res.json({ ok: true, status: "waiting", mode, playerCount: queuedCount });
       return;
     }
   }
   
-  res.json({ ok: true, status: "none" });
+  // 检查是否在活跃匹配中
+  for (const [matchId, match] of activeMatches.entries()) {
+    if (match.players.some((p) => String(p.id) === String(userId))) {
+      const existingMode = normalizeMatchMode(match.mode);
+      const existingCount = normalizeBattlePlayerCount(match.playerCount || match.players.length);
+      if (existingMode === mode && existingCount === targetPlayerCount) {
+        res.json({ ok: true, status: "matched", matchId, match, mode, playerCount: existingCount });
+        return;
+      }
+    }
+  }
+  
+  res.json({ ok: true, status: "none", mode, playerCount: targetPlayerCount });
 });
 
 // 获取匹配中的玩家信息
@@ -5560,7 +5677,7 @@ app.get("/api/match/recommend", async (req, res) => {
   // 使用预定义的推荐用户列表
   const defaultUserIds = ["2292998", "2158643", "2279094", "2285987", "2234123", "2312342"];
   const recommendedUsers = defaultUserIds
-    .filter(id => id !== userId)
+    .filter((id) => String(id) !== String(userId))
     .slice(0, 6)
     .map(id => ({
       id: id,
@@ -5980,10 +6097,11 @@ app.get("/match", async (req, res) => {
     res.redirect("/login");
     return;
   }
-  const mode = req.query.mode || "quick";
+  const rawMode = normalizeMatchMode(req.query.mode);
+  const mode = rawMode === "ranked" || rawMode === "slaughter" ? rawMode : "quick";
   const hero = req.query.hero || "";
   const playerCount = normalizeBattlePlayerCount(req.query.players);
-  const matchSubtitle = mode === "quick" ? `正在寻找 ${playerCount} 人场对手...` : "正在寻找对手...";
+  const matchSubtitle = mode === "slaughter" ? "正在寻找对手..." : `正在寻找 ${playerCount} 人场对手...`;
   res.send(`<!doctype html>
   <html lang="zh-CN">
     <head>
@@ -6120,7 +6238,12 @@ app.get("/match", async (req, res) => {
         // 检查匹配状态
         async function checkMatchStatus() {
           try {
-            const resp = await fetch("/api/match/status");
+            const statusUrl =
+              "/api/match/status?mode=" +
+              encodeURIComponent(mode) +
+              "&players=" +
+              encodeURIComponent(String(playerCount));
+            const resp = await fetch(statusUrl);
             const json = await resp.json();
             if (json.ok) {
               if (json.status === "matched") {
@@ -6214,7 +6337,7 @@ app.get("/battle/slaughter", async (req, res) => {
   
   // 如果没有 matchId，重定向到匹配页面
   if (!matchId) {
-    res.redirect(`/match?mode=slaughter&hero=${hero}`);
+    res.redirect(`/match?mode=slaughter&hero=${encodeURIComponent(hero)}`);
     return;
   }
   
@@ -6229,14 +6352,23 @@ app.get("/battle/ranked", async (req, res) => {
   }
   const hero = typeof req.query.hero === "string" ? req.query.hero : "";
   const matchId = req.query.matchId || "";
+  const playerCount = normalizeBattlePlayerCount(req.query.players);
   
   // 如果没有 matchId，重定向到匹配页面
   if (!matchId) {
-    res.redirect(`/match?mode=ranked&hero=${hero}`);
+    res.redirect(`/match?mode=ranked&hero=${encodeURIComponent(hero)}&players=${playerCount}`);
     return;
   }
   
-  res.send(renderQuickBattlePage(session?.user || null, { mode: "ranked", selectedHeroId: hero, rankProgress: session.rankProgress, matchId: matchId }));
+  res.send(
+    renderQuickBattlePage(session?.user || null, {
+      mode: "ranked",
+      selectedHeroId: hero,
+      rankProgress: session.rankProgress,
+      matchId: matchId,
+      playerCount,
+    })
+  );
 });
 
 app.get("/tutorial", async (req, res) => {
