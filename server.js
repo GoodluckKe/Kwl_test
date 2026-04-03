@@ -123,6 +123,10 @@ const SECONDME_MATCH_CHAT_KEY_PREFIX = "match_chat_";
 const MATCH_CHAT_MAX_MESSAGES = 120;
 const MATCH_CHAT_SYNC_INTERVAL_MS = 5000;
 const MATCH_CHAT_RANDOM_SPEAK_INTERVAL_MS = 8000;
+const WAR_PLAZA_DEFAULT_LIMIT = 30;
+const WAR_PLAZA_MAX_LIMIT = 60;
+const WAR_PLAZA_DEFAULT_TAGS = ["战神广场", "神迹对决", "战绩心得"];
+const SECONDME_THIRD_PARTY_BASE = "https://app.mindos.com/gate/in/rest/third-party-agent/v1";
 const LOL_RANK_DIVISIONS = ["IV", "III", "II", "I"];
 const LOL_RANK_TIERS_WITH_DIVISIONS = [
   { name: "坚韧黑铁", title: "从基础开始，稳住每一回合节奏。" },
@@ -1925,6 +1929,763 @@ async function saveRankProgressToSecondMe(accessToken, rankProgress) {
   }
 }
 
+function normalizeWarPlazaLimit(value, fallback = WAR_PLAZA_DEFAULT_LIMIT) {
+  const limit = Number(value);
+  if (!Number.isFinite(limit) || limit <= 0) return fallback;
+  return Math.max(1, Math.min(WAR_PLAZA_MAX_LIMIT, Math.floor(limit)));
+}
+
+function buildSecondMeApiUrl(pathname, query = null) {
+  if (!pathname) return "";
+  const base = String(SECONDME_API_BASE_URL || "").replace(/\/+$/, "");
+  const url = pathname.startsWith("http://") || pathname.startsWith("https://")
+    ? new URL(pathname)
+    : new URL(`${base}${pathname.startsWith("/") ? pathname : `/${pathname}`}`);
+  if (query && typeof query === "object") {
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null || value === "") continue;
+      url.searchParams.set(String(key), String(value));
+    }
+  }
+  return url.toString();
+}
+
+function secondMeResponseSuccess(resp, json) {
+  if (!resp?.ok) return false;
+  if (!json || typeof json !== "object") return true;
+  const code = Number(json.code);
+  if (Number.isFinite(code) && code !== 0) return false;
+  if (json.ok === false || json.success === false) return false;
+  return true;
+}
+
+function secondMeResponseData(json) {
+  if (!json || typeof json !== "object") return null;
+  if (json.data !== undefined) return json.data;
+  if (json.result !== undefined) return json.result;
+  if (json.items !== undefined) return json.items;
+  if (json.list !== undefined) return json.list;
+  return null;
+}
+
+function isPlazaInvitationRequiredResult(result) {
+  const text = [
+    result?.json?.subCode,
+    result?.json?.code,
+    result?.json?.error,
+    result?.json?.message,
+    result?.text,
+  ]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
+  return text.includes("invitation.required") || text.includes("plaza.invitation");
+}
+
+function isThirdPartyAgentTokenInvalidResult(result) {
+  const text = [
+    result?.json?.subCode,
+    result?.json?.code,
+    result?.json?.error,
+    result?.json?.message,
+    result?.text,
+  ]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
+  return (
+    text.includes("third.party.agent.token.invalid") ||
+    text.includes("third-party agent token is required") ||
+    text.includes("third-party agent token is invalid")
+  );
+}
+
+async function callSecondMeCandidates(accessToken, candidates = []) {
+  let lastError = null;
+  const attempts = [];
+  let invitationRequiredError = null;
+  let tokenInvalidError = null;
+  for (const candidate of candidates) {
+    const method = String(candidate?.method || "GET").toUpperCase();
+    const path = String(candidate?.path || "").trim();
+    if (!path) continue;
+    const url = buildSecondMeApiUrl(path, candidate?.query || null);
+    const headers = {};
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+    let body = undefined;
+    if (candidate?.body !== undefined && candidate?.body !== null) {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify(candidate.body);
+    }
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers,
+        body,
+      });
+      const text = await resp.text();
+      let json = null;
+      if (text) {
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = null;
+        }
+      }
+      if (secondMeResponseSuccess(resp, json)) {
+        return {
+          ok: true,
+          path,
+          url,
+          status: resp.status,
+          json,
+          text,
+        };
+      }
+      const failed = {
+        ok: false,
+        path,
+        url,
+        status: resp.status,
+        json,
+        text,
+      };
+      attempts.push(failed);
+      if (!tokenInvalidError && isThirdPartyAgentTokenInvalidResult(failed)) {
+        tokenInvalidError = failed;
+      }
+      if (!invitationRequiredError && isPlazaInvitationRequiredResult(failed)) {
+        invitationRequiredError = failed;
+      }
+      lastError = failed;
+    } catch (error) {
+      const failed = {
+        ok: false,
+        path,
+        url,
+        status: 0,
+        json: null,
+        text: "",
+        error: error instanceof Error ? error.message : String(error),
+      };
+      attempts.push(failed);
+      lastError = failed;
+    }
+  }
+  if (invitationRequiredError) {
+    return {
+      ...invitationRequiredError,
+      error: "plaza_not_activated",
+      attempts,
+    };
+  }
+  if (tokenInvalidError) {
+    return {
+      ...tokenInvalidError,
+      error: "plaza_agent_token_invalid",
+      attempts,
+    };
+  }
+  if (lastError) {
+    return {
+      ...lastError,
+      attempts,
+    };
+  }
+  return { ok: false, status: 0, error: "no_candidate_available", attempts };
+}
+
+async function getPlazaAccessState(accessToken) {
+  if (!accessToken) {
+    return { ok: false, activated: false, reason: "missing_access_token" };
+  }
+  const result = await callSecondMeCandidates(accessToken, [
+    { method: "GET", path: `${SECONDME_THIRD_PARTY_BASE}/plaza/access` },
+    { method: "GET", path: "/api/secondme/plaza/access" },
+    { method: "GET", path: "/api/plaza/access" },
+  ]);
+  if (!result?.ok) {
+    if (result?.error === "plaza_agent_token_invalid") {
+      return {
+        ok: false,
+        activated: false,
+        reason: "plaza_agent_token_invalid",
+        debug: result,
+      };
+    }
+    if (result?.error === "plaza_not_activated") {
+      return {
+        ok: false,
+        activated: false,
+        reason: "plaza_not_activated",
+        debug: result,
+      };
+    }
+    return {
+      ok: true,
+      activated: true,
+      uncertain: true,
+      reason: "plaza_access_check_unavailable",
+      debug: result,
+    };
+  }
+  const payload = secondMeResponseData(result.json) ?? result.json ?? {};
+  if (payload && typeof payload === "object" && payload.activated === false) {
+    return {
+      ok: false,
+      activated: false,
+      reason: "plaza_not_activated",
+      payload,
+      debug: result,
+    };
+  }
+  return { ok: true, activated: true, payload, debug: result };
+}
+
+function getPlazaAccessToken(session) {
+  const plazaToken = String(session?.token?.plazaAccessToken || "").trim();
+  if (plazaToken) return plazaToken;
+  const accessToken = String(session?.token?.accessToken || "").trim();
+  if (accessToken.startsWith("sm-")) return accessToken;
+  const localToken = readLocalSecondMeAccessToken();
+  if (localToken) return localToken;
+  return accessToken;
+}
+
+function extractSmcCode(raw) {
+  const input = String(raw || "").trim();
+  if (!input) return "";
+  const direct = input.match(/smc-[A-Za-z0-9_-]+/);
+  if (direct && direct[0]) return direct[0];
+  try {
+    const asUrl = new URL(input);
+    const fromQuery = String(asUrl.searchParams.get("code") || "").trim();
+    if (fromQuery && /^smc-[A-Za-z0-9_-]+$/.test(fromQuery)) return fromQuery;
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function readLocalSecondMeAccessToken() {
+  const candidates = [
+    `${process.env.HOME || ""}/.secondme/credentials`,
+    `${process.env.HOME || ""}/.openclaw/.credentials`,
+  ].filter(Boolean);
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const raw = fs.readFileSync(file, "utf8");
+      const json = JSON.parse(raw);
+      const token = String(json?.accessToken || json?.access_token || "").trim();
+      if (token.startsWith("sm-")) return token;
+    } catch {
+      continue;
+    }
+  }
+  return "";
+}
+
+function normalizePlazaAuthor(raw) {
+  const base = raw && typeof raw === "object" ? raw : {};
+  const id = String(base.id || base.userId || base.uid || base.oauthId || "");
+  return {
+    id,
+    name: String(base.nickname || base.name || base.displayName || (id ? `用户${id.slice(-4)}` : "SecondMe 玩家")),
+    avatar: getUserAvatarUrl(base),
+  };
+}
+
+function normalizePlazaTags(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8);
+  }
+  if (typeof raw === "string") {
+    return raw
+      .split(/[#,，,\s]+/g)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+  return [];
+}
+
+function normalizePlazaTimestamp(value) {
+  const asNumber = Number(value);
+  if (Number.isFinite(asNumber) && asNumber > 0) return asNumber;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return Date.now();
+}
+
+function normalizePlazaComment(raw, fallbackPostId = "") {
+  const row = raw && typeof raw === "object" ? raw : {};
+  const id = String(row.id || row.commentId || row.cid || "");
+  const content = String(row.content || row.message || row.text || "").trim();
+  if (!content) return null;
+  const postId = String(row.postId || row.targetPostId || row.plazaPostId || fallbackPostId || "");
+  return {
+    id: id || `comment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    postId,
+    parentId: String(row.parentId || row.replyToId || row.rootCommentId || ""),
+    content: content.slice(0, 2000),
+    createdAt: normalizePlazaTimestamp(row.createdAt || row.timestamp || row.time || row.createTime),
+    author: normalizePlazaAuthor(row.author || row.user || row.publisher || row.creator),
+    likeCount: Math.max(0, Number(row.likeCount || row.likes || row.praiseCount || 0) || 0),
+    likedByMe: Boolean(row.likedByMe || row.isLiked || row.myLiked),
+  };
+}
+
+function normalizePlazaPost(raw) {
+  const base = raw && typeof raw === "object" ? raw : {};
+  const nestedPost = base.post && typeof base.post === "object" ? base.post : null;
+  const row = nestedPost ? { ...nestedPost, ...base } : base;
+  const id = String(row.id || row.postId || row.pid || row.uuid || "");
+  const content = String(row.content || row.postContent || row.textContent || row.message || row.text || row.body || "").trim();
+  if (!id || !content) return null;
+  const commentsRaw = Array.isArray(row.comments)
+    ? row.comments
+    : Array.isArray(row.commentList)
+      ? row.commentList
+      : [];
+  const comments = commentsRaw.map((item) => normalizePlazaComment(item, id)).filter(Boolean);
+  return {
+    id,
+    title: String(row.title || row.subject || "").trim().slice(0, 120),
+    content: content.slice(0, 6000),
+    tags: normalizePlazaTags(row.tags || row.tagList || row.topicTags),
+    createdAt: normalizePlazaTimestamp(row.createdAt || row.timestamp || row.time || row.createTime),
+    author: normalizePlazaAuthor(row.author || row.user || row.publisher || row.creator),
+    likeCount: Math.max(0, Number(row.likeCount || row.likes || row.praiseCount || 0) || 0),
+    commentCount: Math.max(
+      comments.length,
+      Number(row.commentCount || row.commentsCount || row.replyCount || 0) || 0
+    ),
+    likedByMe: Boolean(row.likedByMe || row.isLiked || row.myLiked),
+    comments,
+  };
+}
+
+function normalizePlazaPostArray(input) {
+  let rows = input;
+  if (!rows) return [];
+  if (!Array.isArray(rows) && typeof rows === "object") {
+    rows =
+      rows.list ||
+      rows.items ||
+      rows.records ||
+      rows.posts ||
+      rows.feed ||
+      rows.rows ||
+      rows.data ||
+      [];
+  }
+  if (!Array.isArray(rows)) return [];
+  return rows.map((item) => normalizePlazaPost(item)).filter(Boolean);
+}
+
+async function fetchPlazaFeedFromSecondMe(accessToken, options = {}) {
+  const access = await getPlazaAccessState(accessToken);
+  if (!access.ok) return { ok: false, posts: [], error: access.reason, debug: access.debug };
+  const limit = normalizeWarPlazaLimit(options.limit);
+  const pageNo = Math.max(1, Number(options.pageNo) || 1);
+  const pageSize = limit;
+  const result = await callSecondMeCandidates(accessToken, [
+    {
+      method: "GET",
+      path: `${SECONDME_THIRD_PARTY_BASE}/plaza/feed`,
+      query: { page: pageNo, pageSize, sortMode: "timeline" },
+    },
+    { method: "GET", path: "/api/secondme/plaza/posts", query: { limit, pageNo, pageSize } },
+    { method: "GET", path: "/api/secondme/plaza/feed", query: { limit, pageNo, pageSize } },
+    { method: "GET", path: "/api/plaza/posts", query: { limit, pageNo, pageSize } },
+    { method: "GET", path: "/api/plaza/feed", query: { limit, pageNo, pageSize } },
+  ]);
+  if (!result?.ok) return { ok: false, posts: [], debug: result };
+  const payload = secondMeResponseData(result.json) ?? result.json ?? [];
+  const posts = normalizePlazaPostArray(payload)
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    .slice(0, limit);
+  return { ok: true, posts, debug: result };
+}
+
+async function publishPlazaPostToSecondMe(accessToken, input = {}) {
+  const access = await getPlazaAccessState(accessToken);
+  if (!access.ok) return { ok: false, error: access.reason, debug: access.debug };
+  const content = String(input.content || "").trim().slice(0, 6000);
+  if (!content) return { ok: false, error: "empty_content" };
+  const title = String(input.title || "").trim().slice(0, 120);
+  const tags = normalizePlazaTags(input.tags);
+  const payload = {
+    title,
+    content,
+    tags: tags.length ? tags : WAR_PLAZA_DEFAULT_TAGS,
+    isPublic: true,
+    timestamp: Date.now(),
+  };
+  const candidates = [];
+  const paths = [
+    `${SECONDME_THIRD_PARTY_BASE}/plaza/posts`,
+    "/api/secondme/plaza/post",
+    "/api/secondme/plaza/posts",
+    "/api/plaza/post",
+    "/api/plaza/posts",
+  ];
+  const bodies = [
+    payload,
+    {
+      content: title ? `${title}\n\n${content}` : content,
+      type: "public",
+      contentType: "discussion",
+      topicTitle: title || undefined,
+      isNotification: false,
+    },
+    { post: payload },
+    {
+      content: payload.content,
+      title: payload.title,
+      tags: payload.tags,
+      visibility: "public",
+      isPublic: true,
+      timestamp: payload.timestamp,
+    },
+  ];
+  for (const path of paths) {
+    for (const body of bodies) {
+      candidates.push({ method: "POST", path, body });
+    }
+  }
+  const result = await callSecondMeCandidates(accessToken, candidates);
+  if (!result?.ok) return { ok: false, debug: result };
+  const data = secondMeResponseData(result.json) ?? result.json ?? {};
+  const normalized =
+    normalizePlazaPost(data) ||
+    normalizePlazaPost({
+      id: String(data?.id || data?.postId || data?.data?.id || `local-${Date.now()}`),
+      content: payload.content,
+      title: payload.title,
+      tags: payload.tags,
+      author: data?.author || null,
+      createdAt: Date.now(),
+      likeCount: 0,
+      commentCount: 0,
+    });
+  return { ok: true, post: normalized, debug: result };
+}
+
+async function fetchPlazaCommentsFromSecondMe(accessToken, postId, options = {}) {
+  const access = await getPlazaAccessState(accessToken);
+  if (!access.ok) return { ok: false, comments: [], error: access.reason, debug: access.debug };
+  const cleanPostId = String(postId || "").trim();
+  if (!cleanPostId) return { ok: false, comments: [], error: "invalid_post_id" };
+  const limit = normalizeWarPlazaLimit(options.limit, 40);
+  const encoded = encodeURIComponent(cleanPostId);
+  const result = await callSecondMeCandidates(accessToken, [
+    {
+      method: "GET",
+      path: `${SECONDME_THIRD_PARTY_BASE}/plaza/posts/${encoded}/comments`,
+      query: { page: 1, pageSize: limit },
+    },
+    { method: "GET", path: `/api/secondme/plaza/post/${encoded}/comments`, query: { limit, pageNo: 1, pageSize: limit } },
+    { method: "GET", path: `/api/secondme/plaza/posts/${encoded}/comments`, query: { limit, pageNo: 1, pageSize: limit } },
+    { method: "GET", path: "/api/secondme/plaza/comment/list", query: { postId: cleanPostId, limit, pageNo: 1, pageSize: limit } },
+    { method: "GET", path: `/api/plaza/post/${encoded}/comments`, query: { limit, pageNo: 1, pageSize: limit } },
+    { method: "GET", path: `/api/plaza/posts/${encoded}/comments`, query: { limit, pageNo: 1, pageSize: limit } },
+  ]);
+  if (!result?.ok) return { ok: false, comments: [], debug: result };
+  const payload = secondMeResponseData(result.json) ?? result.json ?? [];
+  let rows = payload;
+  if (!Array.isArray(rows) && rows && typeof rows === "object") {
+    rows = rows.list || rows.items || rows.records || rows.comments || rows.rows || [];
+  }
+  const comments = (Array.isArray(rows) ? rows : [])
+    .map((item) => normalizePlazaComment(item, cleanPostId))
+    .filter(Boolean)
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0))
+    .slice(0, limit);
+  return { ok: true, comments, debug: result };
+}
+
+async function publishPlazaCommentToSecondMe(accessToken, postId, input = {}) {
+  const access = await getPlazaAccessState(accessToken);
+  if (!access.ok) return { ok: false, error: access.reason, debug: access.debug };
+  const cleanPostId = String(postId || "").trim();
+  const content = String(input.content || "").trim().slice(0, 2000);
+  const parentId = String(input.parentId || "").trim().slice(0, 120);
+  if (!cleanPostId || !content) return { ok: false, error: "invalid_comment_payload" };
+  const encoded = encodeURIComponent(cleanPostId);
+  const payload = {
+    postId: cleanPostId,
+    content,
+    parentId: parentId || undefined,
+    timestamp: Date.now(),
+  };
+  const candidates = [];
+  const paths = [
+    `${SECONDME_THIRD_PARTY_BASE}/plaza/posts/${encoded}/comments`,
+    "/api/secondme/plaza/comment",
+    "/api/secondme/plaza/post/comment",
+    `/api/secondme/plaza/posts/${encoded}/comments`,
+    "/api/plaza/comment",
+    "/api/plaza/post/comment",
+    `/api/plaza/posts/${encoded}/comments`,
+  ];
+  const bodies = [
+    payload,
+    { postId: cleanPostId, message: content, parentId: parentId || undefined, timestamp: payload.timestamp },
+    { id: cleanPostId, content, parentId: parentId || undefined, timestamp: payload.timestamp },
+  ];
+  for (const path of paths) {
+    for (const body of bodies) {
+      candidates.push({ method: "POST", path, body });
+    }
+  }
+  const result = await callSecondMeCandidates(accessToken, candidates);
+  if (!result?.ok) return { ok: false, debug: result };
+  const data = secondMeResponseData(result.json) ?? result.json ?? {};
+  const comment = normalizePlazaComment(data, cleanPostId) || {
+    id: String(data?.id || data?.commentId || `comment-${Date.now()}`),
+    postId: cleanPostId,
+    parentId,
+    content,
+    createdAt: Date.now(),
+    author: normalizePlazaAuthor(data?.author || data?.user),
+    likeCount: 0,
+    likedByMe: false,
+  };
+  return { ok: true, comment, debug: result };
+}
+
+async function sendPlazaLikeToSecondMe(accessToken, postId, action = "toggle") {
+  const access = await getPlazaAccessState(accessToken);
+  if (!access.ok) return { ok: false, error: access.reason, debug: access.debug };
+  const cleanPostId = String(postId || "").trim();
+  if (!cleanPostId) return { ok: false, error: "invalid_post_id" };
+  const normalizedAction = ["like", "unlike", "toggle"].includes(String(action)) ? String(action) : "toggle";
+  const encoded = encodeURIComponent(cleanPostId);
+  const candidates = [];
+  const paths = [
+    `${SECONDME_THIRD_PARTY_BASE}/plaza/posts/${encoded}/like`,
+    "/api/secondme/plaza/like",
+    "/api/secondme/plaza/post/like",
+    `/api/secondme/plaza/posts/${encoded}/like`,
+    "/api/plaza/like",
+    "/api/plaza/post/like",
+    `/api/plaza/posts/${encoded}/like`,
+  ];
+  const bodies = [
+    { postId: cleanPostId, action: normalizedAction, timestamp: Date.now() },
+    { postId: cleanPostId, liked: normalizedAction !== "unlike", timestamp: Date.now() },
+    { id: cleanPostId, action: normalizedAction, timestamp: Date.now() },
+  ];
+  for (const path of paths) {
+    for (const body of bodies) {
+      candidates.push({ method: "POST", path, body });
+    }
+  }
+  const result = await callSecondMeCandidates(accessToken, candidates);
+  if (!result?.ok) return { ok: false, debug: result };
+  return {
+    ok: true,
+    payload: secondMeResponseData(result.json) ?? result.json ?? {},
+    debug: result,
+  };
+}
+
+function getBattleModeLabel(mode) {
+  if (mode === "ranked") return "排位赛";
+  if (mode === "quick") return "快速战斗";
+  if (mode === "slaughter") return "杀戮模式";
+  return "对战模式";
+}
+
+function getBattleOutcomeLabel(result) {
+  return String(result || "").toLowerCase() === "win" ? "胜利" : "失利";
+}
+
+function buildBattleSummaryFallback(history, user) {
+  const {
+    result,
+    playerName,
+    playerHero,
+    opponentName,
+    opponentHero,
+    mode,
+    timestamp,
+    turnCount,
+    winningCamp,
+    battleSummary,
+    remainingHp,
+    maxHp,
+    remainingHand,
+    keyHighlights,
+  } = history;
+  const date = new Date(timestamp).toLocaleString("zh-CN");
+  const modeLabel = getBattleModeLabel(mode);
+  const operator = String(user?.nickname || user?.name || user?.displayName || playerName || "我");
+  const outcomeText = getBattleOutcomeLabel(result);
+  const hpLine =
+    Number.isFinite(Number(remainingHp)) && Number.isFinite(Number(maxHp))
+      ? `收官状态：体力 ${Math.max(0, Number(remainingHp))}/${Math.max(0, Number(maxHp))}，手牌 ${Math.max(0, Number(remainingHand) || 0)}。`
+      : "收官状态：资源交换偏激烈，残局容错空间较小。";
+  const turnLine = Number.isFinite(Number(turnCount)) && Number(turnCount) > 0 ? `回合进程：第 ${Number(turnCount)} 回合完成终局。` : "";
+  const campLine = winningCamp ? `胜利阵营：${winningCamp}。` : "";
+  const highlightLines = Array.isArray(keyHighlights)
+    ? keyHighlights
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, 3)
+        .map((item, index) => `${index + 1}. ${item}`)
+    : [];
+  const advantageLine =
+    String(result || "").toLowerCase() === "win"
+      ? `本局我在关键回合顶住压力，利用 ${playerHero || "主战英雄"} 的技能窗口抢下节奏，最终完成终结。`
+      : `本局前中期还有操作空间，但在关键回合的资源交换上被 ${opponentHero || "对手"} 抓住了漏洞。`;
+  const reflection =
+    String(result || "").toLowerCase() === "win"
+      ? "复盘要点：前两轮保留防御牌，等对手交关键牌后再集中爆发，收益更稳定。"
+      : "复盘要点：需要更早判断场上威胁，减少无效出牌，把防御资源留到真正致命的回合。";
+  return [
+    "【战神广场｜神迹对决战报】",
+    `时间：${date}`,
+    `模式：${modeLabel}`,
+    `结果：${outcomeText}`,
+    campLine,
+    turnLine,
+    "",
+    `本局主角：${operator}（${playerHero || "未知英雄"}）`,
+    `对手焦点：${opponentName || "对手"}（${opponentHero || "未知英雄"}）`,
+    battleSummary ? `结算描述：${String(battleSummary).slice(0, 200)}` : "",
+    hpLine,
+    "",
+    advantageLine,
+    reflection,
+    highlightLines.length ? "关键节点：" : "",
+    ...highlightLines,
+    "欢迎各位在评论区给出你们的打法建议，我会认真看并继续优化思路。",
+    "",
+    "#战神广场 #神迹对决 #战绩复盘 #SecondMe",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function generateBattleSummaryWithSecondMe(accessToken, history, user) {
+  const fallback = buildBattleSummaryFallback(history, user);
+  if (!accessToken) return fallback;
+  const payload = {
+    result: history?.result || "",
+    outcomeLabel: getBattleOutcomeLabel(history?.result || ""),
+    mode: history?.mode || "",
+    modeLabel: getBattleModeLabel(history?.mode || ""),
+    playerName: history?.playerName || "",
+    playerHero: history?.playerHero || "",
+    opponentName: history?.opponentName || "",
+    opponentHero: history?.opponentHero || "",
+    timestamp: history?.timestamp || Date.now(),
+    turnCount: Number(history?.turnCount || 0) || 0,
+    winningCamp: history?.winningCamp || "",
+    battleSummary: history?.battleSummary || "",
+    remainingHp: Number(history?.remainingHp || 0) || 0,
+    maxHp: Number(history?.maxHp || 0) || 0,
+    remainingHand: Number(history?.remainingHand || 0) || 0,
+    remainingPlayers: Number(history?.remainingPlayers || 0) || 0,
+    keyHighlights: Array.isArray(history?.keyHighlights) ? history.keyHighlights.slice(0, 6) : [],
+  };
+  const prompt = `你是《神迹对决》的战术复盘作者，请基于以下战局信息写一条适合发布到 SecondMe 战神广场的帖子：
+${JSON.stringify(payload, null, 2)}
+
+输出要求：
+1. 先给一句亮点总结，再写 2 段复盘（局势判断 + 决策得失），再给 1 段下局计划；
+2. 语气真实、具体，像玩家本人复盘，不要空话；
+3. 必须结合回合数、血量/手牌、关键节点，不要泛泛而谈；
+4. 字数 260~520 字；
+5. 允许引用 2~3 条关键节点，增强可讨论性；
+6. 结尾附上 3~5 个中文话题标签；
+7. 只输出帖子正文，不要解释。`;
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "system",
+            content: "你是卡牌竞技复盘写作助手，擅长输出结构清晰、细节充分、可讨论的社区帖子。",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !json.data?.content) return fallback;
+    const content = String(json.data.content || "").trim();
+    if (!content || content.length < 80) return fallback;
+    if (!content.includes("#")) {
+      return `${content}\n\n#战神广场 #神迹对决 #SecondMe`;
+    }
+    return content.slice(0, 6000);
+  } catch (error) {
+    console.error("生成战绩广场帖子失败，回退模板:", error);
+    return fallback;
+  }
+}
+
+async function loadBattleHistoryFromSecondMe(accessToken) {
+  if (!accessToken) return [];
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !Array.isArray(json.data)) return [];
+    const historyData = json.data.find((item) => item?.key === "battle_history");
+    if (!historyData || !Array.isArray(historyData.value)) return [];
+    return historyData.value
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        ...item,
+        timestamp: Number(item.timestamp) || Date.now(),
+      }))
+      .slice(0, 50);
+  } catch (error) {
+    console.error("加载 SecondMe battle_history 失败:", error);
+    return [];
+  }
+}
+
+async function saveBattleHistoryToSecondMe(accessToken, rows) {
+  if (!accessToken) return false;
+  try {
+    const payload = Array.isArray(rows) ? rows.slice(0, 50) : [];
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key: "battle_history",
+        value: payload,
+        timestamp: Date.now(),
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    return Boolean(resp.ok && json && json.code === 0);
+  } catch (error) {
+    console.error("保存 SecondMe battle_history 失败:", error);
+    return false;
+  }
+}
+
 function getBearerToken(req) {
   const raw = String(req.headers.authorization || "");
   if (!raw.startsWith("Bearer ")) return "";
@@ -2981,7 +3742,6 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           }
           .hero-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
           .card-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
-          .voice-drawer{left:8px;top:92px;width:calc(100vw - 16px);max-height:calc(100svh - 100px)}
           .panel{top:74px;max-height:calc(100svh - 90px)}
           .brand{font-size:36px;letter-spacing:1.5px;justify-self:center}
           .topbar{grid-template-columns:1fr;gap:12px;align-items:center;min-height:0}
@@ -3110,7 +3870,6 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
             max-height:200px;
             min-height:0;
           }
-          .voice-drawer{top:74px;max-height:calc(100svh - 84px)}
           .shell{padding:10px 12px 28px}
           .topbar{min-height:0;gap:8px}
           .brand{font-size:30px;letter-spacing:1px}
@@ -3133,7 +3892,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         <button class="menu-btn" id="heroMenuBtn">英雄介绍</button>
         <button class="menu-btn" id="cardMenuBtn">卡牌图鉴</button>
         <button class="menu-btn" id="historyMenuBtn">历史战绩</button>
-        <button class="menu-btn" id="voiceMenuBtn">语音聊天</button>
+        <button class="menu-btn" id="plazaMenuBtn">战神广场</button>
       </div>
 
 
@@ -3162,23 +3921,6 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         </div>
         <div class="history-list" id="historyList">
           <div class="history-empty">暂无历史战绩</div>
-        </div>
-      </section>
-
-      <section class="card-drawer" id="voiceDrawer">
-        <div class="drawer-head">
-          <div class="drawer-title">语音聊天</div>
-          <button class="close-btn" id="voiceDrawerClose">关闭</button>
-        </div>
-        <div id="voiceMessages" style="height: 300px; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px;">
-          <div style="text-align: center; color: #64748b; font-size: 12px;">暂无语音消息</div>
-        </div>
-        <div style="padding: 12px; border-top: 1px solid rgba(125,211,252,.22); display: flex; flex-direction: column; gap: 8px;">
-          <input type="text" id="voiceInput" placeholder="输入文字转语音..." style="flex: 1; padding: 8px; border: 1px solid rgba(125,211,252,.35); border-radius: 999px; background: #0e1b32; color: #d5e9ff; font-size: 14px;">
-          <div style="display: flex; gap: 8px;">
-            <button id="voiceRecord" style="flex: 1; padding: 8px 16px; background: rgba(248, 113, 113, 0.2); border: 1px solid rgba(248, 113, 113, 0.3); border-radius: 999px; color: #f87171; cursor: pointer; font-weight: 700;">按住说话</button>
-            <button id="voiceSend" style="padding: 8px 16px; background: rgba(74,222,128,.2); border: 1px solid rgba(74,222,128,.4); border-radius: 999px; color: #4ade80; cursor: pointer; font-weight: 700;">发送</button>
-          </div>
         </div>
       </section>
 
@@ -3291,6 +4033,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         const cardDrawer = document.getElementById("cardDrawer");
         const cardDrawerClose = document.getElementById("cardDrawerClose");
         const historyMenuBtn = document.getElementById("historyMenuBtn");
+        const plazaMenuBtn = document.getElementById("plazaMenuBtn");
         const historyDrawer = document.getElementById("historyDrawer");
         const historyDrawerClose = document.getElementById("historyDrawerClose");
         const historyList = document.getElementById("historyList");
@@ -3576,7 +4319,6 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           historyMenuBtn.addEventListener("click", function () {
             if (heroDrawer) heroDrawer.classList.remove("show");
             if (cardDrawer) cardDrawer.classList.remove("show");
-            if (voiceDrawer) voiceDrawer.classList.remove("show");
             loadHistory();
             historyDrawer.classList.toggle("show");
           });
@@ -3586,236 +4328,9 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
             historyDrawer.classList.remove("show");
           });
         }
-
-        const voiceMenuBtn = document.getElementById("voiceMenuBtn");
-        const voiceDrawer = document.getElementById("voiceDrawer");
-        const voiceDrawerClose = document.getElementById("voiceDrawerClose");
-        const voiceMessages = document.getElementById("voiceMessages");
-        const voiceInput = document.getElementById("voiceInput");
-        const voiceRecord = document.getElementById("voiceRecord");
-        const voiceSend = document.getElementById("voiceSend");
-
-        if (voiceMenuBtn && voiceDrawer) {
-          voiceMenuBtn.addEventListener("click", function () {
-            if (heroDrawer) heroDrawer.classList.remove("show");
-            if (cardDrawer) cardDrawer.classList.remove("show");
-            if (historyDrawer) historyDrawer.classList.remove("show");
-            voiceDrawer.classList.toggle("show");
-          });
-        }
-        if (voiceDrawerClose && voiceDrawer) {
-          voiceDrawerClose.addEventListener("click", function () {
-            voiceDrawer.classList.remove("show");
-          });
-        }
-
-        // 语音消息存储
-        const voiceMessagesData = {};
-        let currentAudio = null;
-        let currentAudioId = null;
-
-        if (voiceSend && voiceInput) {
-          voiceSend.addEventListener("click", function () {
-            const text = voiceInput.value.trim();
-            if (!text) return;
-            
-            // 文字转语音
-            if ('speechSynthesis' in window) {
-              const utterance = new SpeechSynthesisUtterance(text);
-              utterance.lang = 'zh-CN';
-              utterance.volume = 0.8;
-              speechSynthesis.speak(utterance);
-            }
-            
-            // 生成唯一ID
-            const messageId = 'voice_' + Date.now();
-            
-            // 显示语音消息
-            if (voiceMessages) {
-              const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-              const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">我 ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(74,222,128,.2); color: #4ade80; font-size: 13px; word-break: break-all;">' + text + '</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span style="font-size: 10px; color: #4ade80;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #4ade80;">0:03</span></div></div>';
-              
-              if (voiceMessages.innerHTML.includes('暂无语音消息')) {
-                voiceMessages.innerHTML = messageHTML;
-              } else {
-                voiceMessages.innerHTML += messageHTML;
-              }
-              voiceMessages.scrollTop = voiceMessages.scrollHeight;
-            }
-            
-            // 存储消息数据
-            voiceMessagesData[messageId] = {
-              text: text,
-              timestamp: Date.now(),
-              type: 'text-to-speech'
-            };
-            
-            voiceInput.value = "";
-          });
-          
-          voiceInput.addEventListener("keypress", function (e) {
-            if (e.key === "Enter") {
-              voiceSend.click();
-            }
-          });
-        }
-
-        // 语音录制功能
-        if (voiceRecord) {
-          let mediaRecorder = null;
-          let audioChunks = [];
-          let startTime = 0;
-          
-          voiceRecord.addEventListener("mousedown", async function () {
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-              mediaRecorder = new MediaRecorder(stream);
-              audioChunks = [];
-              startTime = Date.now();
-              
-              mediaRecorder.ondataavailable = function (event) {
-                if (event.data.size > 0) {
-                  audioChunks.push(event.data);
-                }
-              };
-              
-              mediaRecorder.onstop = function () {
-                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                const duration = Math.round((Date.now() - startTime) / 1000);
-                
-                // 生成唯一ID
-                const messageId = 'voice_' + Date.now();
-                
-                // 显示语音消息
-                if (voiceMessages) {
-                  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-                  const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">我 ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(74,222,128,.2); color: #4ade80; font-size: 13px; word-break: break-all;">语音消息</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span class="voice-status" style="font-size: 10px; color: #4ade80;">▶</span><span style="font-size: 10px; color: #4ade80;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #4ade80;">0:' + (duration < 10 ? '0' + duration : duration) + '</span></div></div>';
-                  
-                  if (voiceMessages.innerHTML.includes('暂无语音消息')) {
-                    voiceMessages.innerHTML = messageHTML;
-                  } else {
-                    voiceMessages.innerHTML += messageHTML;
-                  }
-                  voiceMessages.scrollTop = voiceMessages.scrollHeight;
-                }
-                
-                // 存储消息数据
-                voiceMessagesData[messageId] = {
-                  blob: audioBlob,
-                  duration: duration,
-                  timestamp: Date.now(),
-                  type: 'recorded'
-                };
-                
-                console.log('语音录制完成', audioBlob);
-              };
-              
-              mediaRecorder.start();
-              voiceRecord.textContent = "录制中...";
-              voiceRecord.style.background = "rgba(248, 113, 113, 0.3)";
-            } catch (error) {
-              console.error("语音录制失败:", error);
-            }
-          });
-          
-          voiceRecord.addEventListener("mouseup", function () {
-            if (mediaRecorder && mediaRecorder.state === "recording") {
-              mediaRecorder.stop();
-              // 停止所有音频轨道
-              mediaRecorder.stream.getTracks().forEach(track => track.stop());
-              voiceRecord.textContent = "按住说话";
-              voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
-            }
-          });
-          
-          // 处理鼠标移出按钮的情况
-          voiceRecord.addEventListener("mouseleave", function () {
-            if (mediaRecorder && mediaRecorder.state === "recording") {
-              mediaRecorder.stop();
-              mediaRecorder.stream.getTracks().forEach(track => track.stop());
-              voiceRecord.textContent = "按住说话";
-              voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
-            }
-          });
-        }
-
-        // 语音消息播放功能
-        if (voiceMessages) {
-          voiceMessages.addEventListener("click", function (event) {
-            const voiceMessage = event.target.closest('.voice-message');
-            if (!voiceMessage) return;
-            
-            const messageId = voiceMessage.dataset.voiceId;
-            const messageData = voiceMessagesData[messageId];
-            if (!messageData) return;
-            
-            // 停止当前播放的音频
-            if (currentAudio) {
-              currentAudio.pause();
-              currentAudio.currentTime = 0;
-              if (currentAudioId) {
-                const currentMessage = document.querySelector('[data-voice-id="' + currentAudioId + '"]');
-                if (currentMessage) {
-                  const statusElement = currentMessage.querySelector('.voice-status');
-                  if (statusElement) {
-                    statusElement.textContent = '▶';
-                  }
-                }
-              }
-            }
-            
-            // 如果点击的是当前正在播放的音频，则停止
-            if (currentAudioId === messageId) {
-              currentAudio = null;
-              currentAudioId = null;
-              return;
-            }
-            
-            // 播放新的音频
-            if (messageData.type === 'recorded' && messageData.blob) {
-              currentAudio = new Audio(URL.createObjectURL(messageData.blob));
-            } else if (messageData.type === 'text-to-speech' && messageData.text) {
-              currentAudio = new SpeechSynthesisUtterance(messageData.text);
-              currentAudio.lang = 'zh-CN';
-              currentAudio.volume = 0.8;
-            }
-            
-            if (currentAudio) {
-              currentAudioId = messageId;
-              
-              // 更新播放状态
-              const statusElement = voiceMessage.querySelector('.voice-status');
-              if (statusElement) {
-                statusElement.textContent = '⏸';
-              }
-              
-              // 播放完成处理
-              if (currentAudio instanceof Audio) {
-                currentAudio.onended = function () {
-                  if (currentAudioId === messageId) {
-                    const statusElement = voiceMessage.querySelector('.voice-status');
-                    if (statusElement) {
-                      statusElement.textContent = '▶';
-                    }
-                    currentAudio = null;
-                    currentAudioId = null;
-                  }
-                };
-                currentAudio.play();
-              } else if (currentAudio instanceof SpeechSynthesisUtterance) {
-                currentAudio.onend = function () {
-                  if (currentAudioId === messageId) {
-                    const statusElement = voiceMessage.querySelector('.voice-status');
-                    if (statusElement) {
-                      statusElement.textContent = '▶';
-                    }
-                    currentAudio = null;
-                    currentAudioId = null;
-                  }
-                };
-                speechSynthesis.speak(currentAudio);
-              }
-            }
+        if (plazaMenuBtn) {
+          plazaMenuBtn.addEventListener("click", function () {
+            window.location.href = "/war-plaza";
           });
         }
 
@@ -3945,6 +4460,132 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
           }
         }
       </script>
+    </body>
+  </html>`;
+}
+
+function renderWarPlazaPage({ user, rankProgress }) {
+  const viewer = {
+    id: getStableUserId(user),
+    name: String(user?.nickname || user?.name || user?.displayName || "SecondMe 玩家"),
+    avatar: getUserAvatarUrl(user),
+  };
+  const rankMeta = getRankMeta(rankProgress?.score || 0);
+  const boot = {
+    viewer,
+    rank: {
+      display: rankMeta.display,
+      score: rankMeta.score,
+      progress: rankMeta.progress,
+      progressMax: rankMeta.progressMax,
+      title: rankMeta.title,
+    },
+  };
+  const bootJson = JSON.stringify(boot).replaceAll("<", "\\u003c");
+  return `<!doctype html>
+  <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>战神广场 | 神迹对决</title>
+      <link rel="stylesheet" href="/war-plaza.css" />
+    </head>
+    <body>
+      <div class="wp-page">
+        <header class="wp-header">
+          <a class="wp-back" href="/game">返回大厅</a>
+          <div class="wp-title-wrap">
+            <h1>战神广场</h1>
+            <p>SecondMe 联动社区：战绩、复盘、评论、点赞与互动都在这里。</p>
+          </div>
+          <button class="wp-refresh-btn" id="wpRefreshBtn" type="button">刷新动态</button>
+        </header>
+
+        <section class="wp-composer">
+          <div class="wp-composer-head">
+            <img class="wp-avatar" src="${escapeHtml(viewer.avatar)}" alt="${escapeHtml(viewer.name)}" />
+            <div>
+              <strong>${escapeHtml(viewer.name)}</strong>
+              <span>发布到 SecondMe 战神广场</span>
+            </div>
+          </div>
+          <input id="wpPostTitle" class="wp-input" type="text" maxlength="80" placeholder="标题（可选）：例如《七人场逆风翻盘复盘》" />
+          <textarea id="wpPostContent" class="wp-textarea" maxlength="6000" placeholder="分享你的战局亮点、决策心得、下局计划……"></textarea>
+          <div class="wp-chip-row" id="wpPresetChipRow">
+            <button type="button" class="wp-chip" data-preset="这局我最关键的决策是：">关键决策</button>
+            <button type="button" class="wp-chip" data-preset="我认为本局最容易被忽略的风险点是：">风险复盘</button>
+            <button type="button" class="wp-chip" data-preset="如果重开一局，我会优先调整：">下局计划</button>
+          </div>
+          <div class="wp-compose-actions">
+            <input id="wpPostTags" class="wp-tag-input" type="text" placeholder="标签（逗号分隔，可选）" />
+            <button id="wpPublishBtn" class="wp-publish-btn" type="button">发布到广场</button>
+          </div>
+          <div class="wp-auth-connect" id="wpAuthConnect" hidden>
+            <p>当前账号还没绑定 Plaza 授权码（smc-...），先绑定后即可正常发帖与自动同步。</p>
+            <div class="wp-auth-row">
+              <input id="wpAuthCodeInput" class="wp-tag-input" type="text" placeholder="粘贴 smc- 开头的授权码" />
+              <button id="wpAuthCodeBtn" class="wp-auth-btn" type="button">绑定广场权限</button>
+            </div>
+            <a class="wp-auth-link" href="https://second-me.cn/third-party-agent/auth" target="_blank" rel="noreferrer">打开 SecondMe 授权页获取授权码</a>
+          </div>
+          <p class="wp-compose-tip">每局对战结束后，系统也会自动生成战绩+心得并同步发布到广场。</p>
+        </section>
+
+        <main class="wp-main">
+          <section class="wp-feed-panel">
+            <div class="wp-feed-tabs">
+              <button class="wp-tab active" data-tab="all" type="button">广场动态</button>
+              <button class="wp-tab" data-tab="mine" type="button">我的分享</button>
+            </div>
+            <div class="wp-kpi-grid">
+              <div class="wp-kpi-card">
+                <span>总动态</span>
+                <strong id="wpKpiTotal">0</strong>
+              </div>
+              <div class="wp-kpi-card">
+                <span>我的分享</span>
+                <strong id="wpKpiMine">0</strong>
+              </div>
+              <div class="wp-kpi-card">
+                <span>收到点赞</span>
+                <strong id="wpKpiLikes">0</strong>
+              </div>
+              <div class="wp-kpi-card">
+                <span>收到评论</span>
+                <strong id="wpKpiComments">0</strong>
+              </div>
+            </div>
+            <div id="wpStatus" class="wp-status">正在加载战神广场动态...</div>
+            <div id="wpFeedList" class="wp-feed-list"></div>
+          </section>
+
+          <aside class="wp-side-panel">
+            <div class="wp-side-card">
+              <h3>我的战神名片</h3>
+              <div class="wp-side-row"><span>当前段位</span><strong>${escapeHtml(rankMeta.display)}</strong></div>
+              <div class="wp-side-row"><span>段位积分</span><strong>${rankMeta.score} LP</strong></div>
+              <div class="wp-side-row"><span>本段进度</span><strong>${rankMeta.progress}/${rankMeta.progressMax}</strong></div>
+              <p>${escapeHtml(rankMeta.title)}</p>
+            </div>
+            <div class="wp-side-card">
+              <h3>SecondMe 权限状态</h3>
+              <div class="wp-side-row"><span>登录会话</span><strong id="wpPermLogin">已连接</strong></div>
+              <div class="wp-side-row"><span>广场写权限</span><strong id="wpPermPlaza">检测中</strong></div>
+              <div class="wp-side-row"><span>自动战报同步</span><strong id="wpPermAutoShare">开启</strong></div>
+              <p id="wpPermHint">帖子、评论、点赞、回复都通过 SecondMe API 同步，不是本地单机数据。</p>
+            </div>
+            <div class="wp-side-card">
+              <h3>自动战报队列</h3>
+              <div id="wpBattleDigestList" class="wp-battle-digest-list">
+                <div class="wp-empty">正在读取最近对局与同步状态...</div>
+              </div>
+            </div>
+          </aside>
+        </main>
+      </div>
+
+      <script id="warPlazaBoot" type="application/json">${bootJson}</script>
+      <script src="/war-plaza.js"></script>
     </body>
   </html>`;
 }
@@ -5114,30 +5755,6 @@ function generateAIPlayers(count, userId, userName) {
   return aiPlayers;
 }
 
-function generateBattleSummary(history) {
-  const { result, playerName, playerHero, opponentName, opponentHero, mode, timestamp } = history;
-  const date = new Date(timestamp).toLocaleString();
-  
-  let summary = `【神迹对决】战绩分享\n\n`;
-  summary += `📅 时间：${date}\n`;
-  summary += `🎮 模式：${mode === 'ranked' ? '排位赛' : mode === 'quick' ? '快速战斗' : '休闲模式'}\n\n`;
-  summary += `👑 玩家：${playerName}（${playerHero}）\n`;
-  summary += `🤖 对手：${opponentName}（${opponentHero}）\n\n`;
-  summary += `🏆 结果：${result === 'win' ? '胜利' : '失败'}\n\n`;
-  
-  if (result === 'win') {
-    summary += `🎉 恭喜！你在这场激烈的神话对决中取得了胜利！\n`;
-    summary += `你的英雄 ${playerHero} 展现了强大的实力，成功击败了对手 ${opponentHero}。\n`;
-  } else {
-    summary += `💪 虽然这次失败了，但不要气馁！\n`;
-    summary += `你的英雄 ${playerHero} 在战斗中表现出色，下次一定能够取得胜利！\n`;
-  }
-  
-  summary += `\n#神迹对决 #游戏战绩 #神话对战`;
-  
-  return summary;
-}
-
 app.post("/api/match/join", async (req, res) => {
   const { session } = await getSessionFromRequest(req);
   if (!session?.token?.accessToken || !session?.user) {
@@ -5785,11 +6402,50 @@ app.post("/api/battle/history", async (req, res) => {
     return;
   }
   try {
+    const plazaShare = {
+      attempted: false,
+      ok: false,
+      reason: "not_attempted",
+    };
     // 添加新的历史记录
     const newHistory = {
       ...history,
       timestamp: Date.now(),
+      plazaPosted: false,
     };
+
+    // 先尝试发布到 Plaza（失败也不阻断对局结算）
+    if (session?.token?.accessToken) {
+      plazaShare.attempted = true;
+      try {
+        const summaryToken = session.token.accessToken;
+        const plazaToken = getPlazaAccessToken(session);
+        const battleSummary = await generateBattleSummaryWithSecondMe(summaryToken, newHistory, session?.user || null);
+        const postResult = await publishPlazaPostToSecondMe(plazaToken, {
+          title: "神迹对决｜对局复盘",
+          content: battleSummary,
+          tags: WAR_PLAZA_DEFAULT_TAGS,
+        });
+        if (postResult.ok) {
+          plazaShare.ok = true;
+          plazaShare.reason = "posted";
+          plazaShare.postId = String(postResult?.post?.id || "");
+          newHistory.plazaPosted = true;
+          if (plazaShare.postId) {
+            newHistory.plazaPostId = plazaShare.postId;
+          }
+          console.log("发布战绩到 Plaza 成功");
+        } else {
+          plazaShare.reason = String(postResult?.error || "plaza_post_failed");
+          console.log("发布战绩到 Plaza 失败", postResult.debug || postResult.error || "");
+        }
+      } catch (e) {
+        plazaShare.reason = "plaza_post_exception";
+        console.error("发布战绩到 Plaza 出错:", e);
+      }
+    } else {
+      plazaShare.reason = "missing_secondme_session";
+    }
     
     // 尝试使用 SecondMe Key Memory 存储战绩
     if (session?.token?.accessToken) {
@@ -5877,69 +6533,59 @@ app.post("/api/battle/history", async (req, res) => {
       console.error("保存战绩到数据库出错:", e);
     }
     
-    // 发布帖子到 Plaza
-    if (session?.token?.accessToken) {
-      try {
-        const accessToken = session.token.accessToken;
-        
-        // 生成战绩总结
-        const battleSummary = generateBattleSummary(newHistory);
-        
-        // 发布帖子到 Plaza
-        const postResp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/plaza/post`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            content: battleSummary,
-            isPublic: true,
-            tags: ["游戏", "神迹对决", "战绩"],
-            timestamp: Date.now(),
-          }),
-        });
-        
-        console.log("Plaza 帖子发布响应状态:", postResp.status);
-        const postJson = await postResp.json().catch(() => null);
-        console.log("Plaza 帖子发布响应数据:", postJson);
-        
-        if (postResp.ok && postJson && postJson.code === 0) {
-          console.log("发布战绩到 Plaza 成功");
-        } else {
-          console.log("发布战绩到 Plaza 失败");
-        }
-      } catch (e) {
-        console.error("发布战绩到 Plaza 出错:", e);
-      }
-    }
-    
     // 同时保存到会话存储，以便下次访问时更快加载
-    if (!session.battleHistory) session.battleHistory = [];
-    session.battleHistory.unshift(newHistory);
-    // 只保留最近 50 条战绩
-    if (session.battleHistory.length > 50) {
-      session.battleHistory = session.battleHistory.slice(0, 50);
-    }
-    await persistSession(req, res, "", session);
-    
-    res.json({ ok: true });
-  } catch (error) {
-    console.error("保存战绩出错:", error);
-    // 出错时回退到会话存储
-    try {
+    if (session) {
       if (!session.battleHistory) session.battleHistory = [];
-      session.battleHistory.unshift({
-        ...history,
-        timestamp: Date.now(),
-      });
+      session.battleHistory.unshift(newHistory);
+      // 只保留最近 50 条战绩
       if (session.battleHistory.length > 50) {
         session.battleHistory = session.battleHistory.slice(0, 50);
       }
       await persistSession(req, res, "", session);
-      res.json({ ok: true, warning: "Error saving to storage, using session storage" });
+    }
+    
+    res.json({
+      ok: true,
+      plazaShared: plazaShare.ok,
+      plazaShare,
+    });
+  } catch (error) {
+    console.error("保存战绩出错:", error);
+    // 出错时回退到会话存储
+    try {
+      if (session) {
+        if (!session.battleHistory) session.battleHistory = [];
+        session.battleHistory.unshift({
+          ...history,
+          timestamp: Date.now(),
+          plazaPosted: false,
+        });
+        if (session.battleHistory.length > 50) {
+          session.battleHistory = session.battleHistory.slice(0, 50);
+        }
+        await persistSession(req, res, "", session);
+      }
+      res.json({
+        ok: true,
+        plazaShared: false,
+        plazaShare: {
+          attempted: Boolean(session?.token?.accessToken),
+          ok: false,
+          reason: "history_save_exception",
+        },
+        warning: "Error saving to storage, using session storage",
+      });
     } catch (e) {
-      res.json({ ok: true, warning: "Error saving history, but game ended successfully" });
+      res.json({
+        ok: true,
+        plazaShared: false,
+        plazaShare: {
+          attempted: Boolean(session?.token?.accessToken),
+          ok: false,
+          reason: "history_fallback_exception",
+        },
+        warning: "Error saving history, but game ended successfully",
+      });
     }
   }
 });
@@ -6018,6 +6664,377 @@ app.get("/api/battle/history", async (req, res) => {
     } catch (e) {
       res.json({ ok: true, data: [], warning: "Error loading history, returning empty array" });
     }
+  }
+});
+
+app.get("/api/war-plaza/feed", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  try {
+    const accessToken = getPlazaAccessToken(session);
+    const limit = normalizeWarPlazaLimit(req.query.limit, WAR_PLAZA_DEFAULT_LIMIT);
+    const result = await fetchPlazaFeedFromSecondMe(accessToken, { limit, pageNo: req.query.pageNo });
+    if (!result.ok) {
+      console.error("拉取战神广场动态失败:", result.debug || result.error || "");
+      if (result.error === "plaza_agent_token_invalid") {
+        res.status(401).json({ ok: false, error: "plaza_agent_token_invalid" });
+        return;
+      }
+      if (result.error === "plaza_not_activated") {
+        res.status(412).json({ ok: false, error: "plaza_not_activated" });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: result.error || "plaza_feed_unavailable",
+        detail: result?.debug
+          ? `${result.debug.path || "unknown_path"} (${result.debug.status || 0})`
+          : "",
+      });
+      return;
+    }
+    const viewerId = getStableUserId(session.user);
+    const posts = result.posts.map((post) => ({
+      ...post,
+      isMine: Boolean(viewerId && post?.author?.id && String(post.author.id) === String(viewerId)),
+    }));
+    const myPosts = posts.filter((post) => post.isMine);
+    const summary = {
+      totalPosts: posts.length,
+      myPosts: myPosts.length,
+      myReceivedLikes: myPosts.reduce((sum, post) => sum + (Number(post.likeCount) || 0), 0),
+      myReceivedComments: myPosts.reduce((sum, post) => sum + (Number(post.commentCount) || 0), 0),
+    };
+    const localHistory = Array.isArray(session.battleHistory) ? session.battleHistory : [];
+    const battleDigest = localHistory
+      .slice(0, 10)
+      .map((item, index) => {
+        const timestamp = Number(item?.timestamp || 0) || Date.now() - index * 1000;
+        const rawResult = String(item?.result || "").toLowerCase();
+        return {
+          id: String(item?.id || `${timestamp}-${index}`),
+          mode: String(item?.mode || "quick"),
+          modeLabel: String(item?.modeLabel || getBattleModeLabel(item?.mode || "")),
+          result: rawResult === "win" ? "win" : "loss",
+          resultLabel: rawResult === "win" ? "胜利" : "失利",
+          hero: String(item?.playerHero || "未知英雄"),
+          timestamp,
+          plazaPosted: Boolean(item?.plazaPosted),
+          plazaPostId: String(item?.plazaPostId || ""),
+          summary: String(item?.battleSummary || item?.summary || item?.modeLabel || "").slice(0, 120),
+        };
+      });
+    const battleSummary = {
+      total: localHistory.length,
+      posted: localHistory.filter((item) => item?.plazaPosted).length,
+      pending: localHistory.filter((item) => !item?.plazaPosted).length,
+    };
+    const permissions = {
+      secondMeLogin: true,
+      plazaTokenBound: Boolean(session?.token?.plazaAccessToken),
+      plazaTokenSource: session?.token?.plazaAccessToken ? "plaza_access_token" : "secondme_access_token",
+      autoBattleShareEnabled: true,
+    };
+    res.json({
+      ok: true,
+      viewer: {
+        id: viewerId,
+        name: session.user.nickname || session.user.name || session.user.displayName || "SecondMe 玩家",
+        avatar: getUserAvatarUrl(session.user),
+      },
+      posts,
+      summary,
+      permissions,
+      battleSummary,
+      battleDigest,
+    });
+  } catch (error) {
+    console.error("战神广场动态接口异常:", error);
+    res.status(500).json({ ok: false, error: "plaza_feed_failed" });
+  }
+});
+
+app.post("/api/war-plaza/auth/token-code", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session || !session.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const code = extractSmcCode(body.code || "");
+  if (!code) {
+    res.status(400).json({ ok: false, error: "invalid_auth_code" });
+    return;
+  }
+  try {
+    const tokenResp = await fetch(`${SECONDME_THIRD_PARTY_BASE}/auth/token/code`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ code }),
+    });
+    const tokenJson = await tokenResp.json().catch(() => null);
+    if (!tokenResp.ok || !tokenJson || Number(tokenJson.code) !== 0 || !tokenJson.data?.accessToken) {
+      const subCode = String(tokenJson?.subCode || "");
+      if (subCode === "third.party.agent.code.invalid") {
+        res.status(400).json({
+          ok: false,
+          error: "exchange_plaza_token_failed",
+          detail: "third.party.agent.code.invalid",
+          hint: "授权码已过期/已使用或复制不完整，请重新获取新的 smc 授权码（5 分钟内且仅可使用一次）。",
+        });
+        return;
+      }
+      res.status(400).json({
+        ok: false,
+        error: "exchange_plaza_token_failed",
+        detail: tokenJson?.subCode || tokenJson?.message || tokenResp.statusText || "unknown_error",
+      });
+      return;
+    }
+    if (!session.token || typeof session.token !== "object") {
+      session.token = {};
+    }
+    session.token.plazaAccessToken = String(tokenJson.data.accessToken || "");
+    session.token.plazaTokenType = String(tokenJson.data.tokenType || "Bearer");
+    await persistSession(req, res, "", session);
+    res.json({ ok: true, connected: true });
+  } catch (error) {
+    console.error("绑定 Plaza token 失败:", error);
+    res.status(500).json({ ok: false, error: "exchange_plaza_token_failed" });
+  }
+});
+
+app.post("/api/war-plaza/sync-history", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  try {
+    const accessToken = session.token.accessToken;
+    const plazaAccessToken = getPlazaAccessToken(session);
+    const remoteHistory = await loadBattleHistoryFromSecondMe(accessToken);
+    const localHistory = Array.isArray(session.battleHistory) ? session.battleHistory : [];
+    const mergedMap = new Map();
+    [...remoteHistory, ...localHistory].forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const key = `${String(item.timestamp || "")}-${String(item.playerHero || "")}-${String(item.result || "")}`;
+      if (!mergedMap.has(key)) mergedMap.set(key, { ...item });
+    });
+    const mergedHistory = Array.from(mergedMap.values())
+      .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+      .slice(0, 50);
+    const pending = mergedHistory.filter((item) => !item.plazaPosted).slice(0, 5);
+    let publishedCount = 0;
+    for (const item of pending) {
+      const summary = await generateBattleSummaryWithSecondMe(accessToken, item, session.user);
+      const postResult = await publishPlazaPostToSecondMe(plazaAccessToken, {
+        title: "神迹对决｜对局复盘",
+        content: summary,
+        tags: WAR_PLAZA_DEFAULT_TAGS,
+      });
+      if (!postResult.ok) continue;
+      item.plazaPosted = true;
+      item.plazaPostId = String(postResult?.post?.id || item.plazaPostId || "");
+      publishedCount += 1;
+    }
+    const updated = mergedHistory
+      .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+      .slice(0, 50);
+    session.battleHistory = updated;
+    await persistSession(req, res, "", session);
+    await saveBattleHistoryToSecondMe(accessToken, updated);
+    res.json({
+      ok: true,
+      synced: true,
+      publishedCount,
+      pendingCount: updated.filter((item) => !item.plazaPosted).length,
+    });
+  } catch (error) {
+    console.error("补发战绩到战神广场失败:", error);
+    res.status(500).json({ ok: false, error: "sync_history_failed" });
+  }
+});
+
+app.post("/api/war-plaza/post", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const title = String(body.title || "").trim().slice(0, 120);
+  const content = String(body.content || "").trim().slice(0, 6000);
+  const tags = normalizePlazaTags(body.tags);
+  if (!content) {
+    res.status(400).json({ ok: false, error: "empty_content" });
+    return;
+  }
+  try {
+    const accessToken = getPlazaAccessToken(session);
+    const result = await publishPlazaPostToSecondMe(accessToken, {
+      title,
+      content,
+      tags: tags.length ? tags : WAR_PLAZA_DEFAULT_TAGS,
+    });
+    if (!result.ok) {
+      console.error("发布战神广场帖子失败:", result.debug || result.error || "");
+      if (result.error === "plaza_agent_token_invalid") {
+        res.status(401).json({ ok: false, error: "plaza_agent_token_invalid" });
+        return;
+      }
+      if (result.error === "plaza_not_activated") {
+        res.status(412).json({ ok: false, error: "plaza_not_activated" });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: result.error || "plaza_post_failed",
+        detail: result?.debug
+          ? `${result.debug.path || "unknown_path"} (${result.debug.status || 0})`
+          : "",
+      });
+      return;
+    }
+    res.json({ ok: true, post: result.post });
+  } catch (error) {
+    console.error("发布战神广场帖子异常:", error);
+    res.status(500).json({ ok: false, error: "plaza_post_failed" });
+  }
+});
+
+app.get("/api/war-plaza/post/:postId/comments", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  const postId = String(req.params.postId || "").trim();
+  if (!postId) {
+    res.status(400).json({ ok: false, error: "invalid_post_id" });
+    return;
+  }
+  try {
+    const accessToken = getPlazaAccessToken(session);
+    const limit = normalizeWarPlazaLimit(req.query.limit, 40);
+    const result = await fetchPlazaCommentsFromSecondMe(accessToken, postId, { limit });
+    if (!result.ok) {
+      console.error("拉取战神广场评论失败:", result.debug || result.error || "");
+      if (result.error === "plaza_agent_token_invalid") {
+        res.status(401).json({ ok: false, error: "plaza_agent_token_invalid" });
+        return;
+      }
+      if (result.error === "plaza_not_activated") {
+        res.status(412).json({ ok: false, error: "plaza_not_activated" });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: result.error || "plaza_comment_unavailable",
+        detail: result?.debug
+          ? `${result.debug.path || "unknown_path"} (${result.debug.status || 0})`
+          : "",
+      });
+      return;
+    }
+    res.json({ ok: true, comments: result.comments });
+  } catch (error) {
+    console.error("拉取战神广场评论异常:", error);
+    res.status(500).json({ ok: false, error: "plaza_comment_unavailable" });
+  }
+});
+
+app.post("/api/war-plaza/post/:postId/comments", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  const postId = String(req.params.postId || "").trim();
+  if (!postId) {
+    res.status(400).json({ ok: false, error: "invalid_post_id" });
+    return;
+  }
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const content = String(body.content || "").trim().slice(0, 2000);
+  const parentId = String(body.parentId || "").trim().slice(0, 120);
+  if (!content) {
+    res.status(400).json({ ok: false, error: "empty_comment" });
+    return;
+  }
+  try {
+    const accessToken = getPlazaAccessToken(session);
+    const result = await publishPlazaCommentToSecondMe(accessToken, postId, { content, parentId });
+    if (!result.ok) {
+      console.error("发布战神广场评论失败:", result.debug || result.error || "");
+      if (result.error === "plaza_agent_token_invalid") {
+        res.status(401).json({ ok: false, error: "plaza_agent_token_invalid" });
+        return;
+      }
+      if (result.error === "plaza_not_activated") {
+        res.status(412).json({ ok: false, error: "plaza_not_activated" });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: result.error || "plaza_comment_failed",
+        detail: result?.debug
+          ? `${result.debug.path || "unknown_path"} (${result.debug.status || 0})`
+          : "",
+      });
+      return;
+    }
+    res.json({ ok: true, comment: result.comment });
+  } catch (error) {
+    console.error("发布战神广场评论异常:", error);
+    res.status(500).json({ ok: false, error: "plaza_comment_failed" });
+  }
+});
+
+app.post("/api/war-plaza/post/:postId/like", async (req, res) => {
+  const { session } = await getSessionFromRequest(req);
+  if (!session?.token?.accessToken || !session?.user) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+  const postId = String(req.params.postId || "").trim();
+  if (!postId) {
+    res.status(400).json({ ok: false, error: "invalid_post_id" });
+    return;
+  }
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const action = String(body.action || "toggle");
+  try {
+    const accessToken = getPlazaAccessToken(session);
+    const result = await sendPlazaLikeToSecondMe(accessToken, postId, action);
+    if (!result.ok) {
+      console.error("战神广场点赞失败:", result.debug || result.error || "");
+      if (result.error === "plaza_agent_token_invalid") {
+        res.status(401).json({ ok: false, error: "plaza_agent_token_invalid" });
+        return;
+      }
+      if (result.error === "plaza_not_activated") {
+        res.status(412).json({ ok: false, error: "plaza_not_activated" });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: result.error || "plaza_like_failed",
+        detail: result?.debug
+          ? `${result.debug.path || "unknown_path"} (${result.debug.status || 0})`
+          : "",
+      });
+      return;
+    }
+    res.json({ ok: true, data: result.payload || {} });
+  } catch (error) {
+    console.error("战神广场点赞异常:", error);
+    res.status(500).json({ ok: false, error: "plaza_like_failed" });
   }
 });
 
@@ -6378,6 +7395,21 @@ app.get("/tutorial", async (req, res) => {
     renderTutorialPage({
       user: session?.user || null,
       rankProgress: session?.rankProgress || createRankProgress(),
+    })
+  );
+});
+
+app.get("/war-plaza", async (req, res) => {
+  if (!requireConfig(res)) return;
+  const { session } = await getOrCreateSession(req, res);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.redirect("/login");
+    return;
+  }
+  res.send(
+    renderWarPlazaPage({
+      user: session.user,
+      rankProgress: session.rankProgress || createRankProgress(),
     })
   );
 });

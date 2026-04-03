@@ -1541,14 +1541,30 @@
     try {
       const human = state.players.find(p => p.id === state.humanPlayerId);
       if (!human) return;
+      const keyHighlights = state.logs
+        .map((entry) => String(entry?.text || "").trim())
+        .filter(Boolean)
+        .slice(0, 28)
+        .filter((line, index, arr) => arr.indexOf(line) === index)
+        .slice(0, 6);
       
       const history = {
-        result: didHumanWin() ? 'win' : 'lose',
+        result: didHumanWin() ? 'win' : 'loss',
+        outcomeLabel: didHumanWin() ? "胜利" : "失利",
         playerName: human.name || 'Player',
         playerHero: human.hero.name,
         opponentName: 'AI Opponent',
         opponentHero: 'AI Hero',
-        mode: modeConfig.label,
+        mode: modeConfig.key,
+        modeLabel: modeConfig.label,
+        winningCamp: state.gameOver && state.gameOver.camp ? state.gameOver.camp : "",
+        battleSummary: state.gameOver && state.gameOver.text ? state.gameOver.text : "",
+        turnCount: Number(state.turn) || 1,
+        remainingHp: Math.max(0, Number(human.hp) || 0),
+        maxHp: Math.max(0, Number(human.maxHp) || 0),
+        remainingHand: Array.isArray(human.hand) ? human.hand.length : 0,
+        remainingPlayers: state.players.filter((player) => !player.dead).length,
+        keyHighlights,
         timestamp: Date.now()
       };
       
@@ -1561,6 +1577,20 @@
       const json = await response.json().catch(() => null);
       if (!response.ok || !json?.ok) {
         console.error('保存战绩失败:', json?.error);
+        return;
+      }
+      if (json.plazaShared === true && refs.hint) {
+        refs.hint.textContent = "战绩已自动同步到 SecondMe 战神广场，欢迎前往查看点赞与评论。";
+      }
+      if (json.plazaShared === false) {
+        const reason = String(json?.plazaShare?.reason || "unknown");
+        console.warn("战绩已保存，但战神广场自动发布未完成:", reason);
+        if (refs.hint) {
+          refs.hint.textContent =
+            reason === "plaza_agent_token_invalid"
+              ? "战绩已保存：需先在战神广场绑定 smc 授权码后才能自动发布。"
+              : "战绩已保存，广场自动发布未完成，可前往战神广场手动发布。";
+        }
       }
     } catch (error) {
       console.error('保存战绩失败:', error);
