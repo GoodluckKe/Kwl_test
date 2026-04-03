@@ -140,7 +140,7 @@ const LOL_RANK_TIERS_WITH_DIVISIONS = [
 const LOL_RANK_APEX_TIERS = [
   { name: "超凡大师", title: "突破钻石门槛，进入顶尖竞争。" },
   { name: "傲世宗师", title: "全服强者行列，博弈强度持续拉满。" },
-  { name: "最强王者", title: "英雄联盟式巅峰段位，向更高积分冲刺。" },
+  { name: "最强王者", title: "巅峰段位，向更高积分冲刺。" },
 ];
 const GUIDE_BEGINNER_HERO_IDS = ["华夏-大禹", "奥林匹斯-雅典娜", "凯美特-拉"];
 const GUIDE_CARD_NAMES = ["神击", "神盾", "灵药", "天罚", "雷霆之怒", "神之恩典"];
@@ -3066,7 +3066,7 @@ function getBattleModeMeta(mode) {
       key: "ranked",
       label: "排位赛",
       drawPhaseCount: 2,
-      intro: "在排位赛中累积 LP，按 LoL 段位体系持续晋升。",
+      intro: "在排位赛中累积 LP，持续晋升段位。",
       rankEnabled: true,
     };
   }
@@ -3933,7 +3933,7 @@ function renderPage({ isLoggedIn, user, rankProgress }) {
         ${isLoggedIn ? `<div class="login-state" id="loginState">SecondMe 登录成功</div>` : ""}
         <div class="mode-row">
           <button class="mode-btn active" data-mode="quick"><span class="mode-btn-label">快速战斗</span><span class="mode-btn-sub">支持 5/6/7/8 人场，身份规则不变</span></button>
-          <button class="mode-btn" data-mode="ranked"><span class="mode-btn-label">排位赛</span><span class="mode-btn-sub">LoL 段位体系，支持 5/6/7/8 人场</span></button>
+          <button class="mode-btn" data-mode="ranked"><span class="mode-btn-label">排位赛</span><span class="mode-btn-sub">经典段位赛制，支持 5/6/7/8 人场</span></button>
           <button class="mode-btn" data-mode="slaughter"><span class="mode-btn-label">杀戮模式</span><span class="mode-btn-sub">高资源高爆发，适合爽局与压制</span></button>
           <button class="mode-btn" data-mode="tutorial"><span class="mode-btn-label">新手教学</span><span class="mode-btn-sub">从身份、卡牌到实战决策一步看懂</span></button>
         </div>
@@ -5494,14 +5494,39 @@ function normalizeMatchMessageType(type) {
   return String(type || "").toLowerCase() === "voice" ? "voice" : "chat";
 }
 
+function normalizeVoiceMeta(input) {
+  if (!input || typeof input !== "object") return null;
+  const durationSec = Math.max(1, Math.min(180, Number(input.durationSec || input.duration || 0) || 0));
+  const source = String(input.source || input.kind || "text").trim().slice(0, 24);
+  if (!durationSec) return null;
+  return {
+    durationSec,
+    source: source || "text",
+  };
+}
+
+function sanitizeMatchMessagePayload(payload = {}) {
+  const messageType = normalizeMatchMessageType(payload.messageType || payload.type);
+  const text = String(payload.message || payload.content || "").trim().replace(/\s+/g, " ");
+  const message = text.slice(0, 200);
+  return {
+    message,
+    messageType,
+    voiceMeta: messageType === "voice" ? normalizeVoiceMeta(payload.voiceMeta || payload.voice || null) : null,
+  };
+}
+
 function createMatchChatMessage(player, text, type = "chat", extra = {}) {
   const message = String(text || "").trim().slice(0, 200);
+  const normalizedType = normalizeMatchMessageType(type);
+  const voiceMeta = normalizedType === "voice" ? normalizeVoiceMeta(extra.voiceMeta || extra.voice || null) : null;
   return {
     id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     playerId: String(player?.id || ""),
     playerName: String(player?.name || "玩家"),
     message,
-    type: normalizeMatchMessageType(type),
+    type: normalizedType,
+    ...(voiceMeta ? { voiceMeta } : {}),
     timestamp: Date.now(),
     origin: String(extra.origin || "player"),
   };
@@ -5518,6 +5543,7 @@ function normalizeStoredMatchChat(item) {
     playerName: String(item.playerName || item.name || "玩家"),
     message,
     type: normalizeMatchMessageType(item.type || item.messageType),
+    voiceMeta: normalizeVoiceMeta(item.voiceMeta || item.voice || null),
     timestamp: Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now(),
     origin: String(item.origin || "player"),
   };
@@ -5647,14 +5673,68 @@ function parseSecondMeReplyArray(content) {
   return [];
 }
 
-async function generateSecondMeReplies(accessToken, match, sender, message, messageType) {
+async function callSecondMeChatKernel(accessToken, messages, options = {}) {
+  if (!accessToken) return { ok: false, error: "missing_access_token", content: "" };
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: Array.isArray(messages) ? messages : [],
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !json.data?.content) {
+      return {
+        ok: false,
+        error: "secondme_kernel_failed",
+        detail: json?.message || json?.subCode || resp.statusText || "unknown",
+        content: "",
+      };
+    }
+    const content = String(json.data.content || "").trim();
+    if (!content) {
+      return { ok: false, error: "empty_kernel_content", content: "" };
+    }
+    return { ok: true, content };
+  } catch (error) {
+    return {
+      ok: false,
+      error: "secondme_kernel_exception",
+      detail: error instanceof Error ? error.message : String(error),
+      content: "",
+    };
+  }
+}
+
+function buildRecentDialogueForKernel(chats, limit = 8) {
+  const rows = (Array.isArray(chats) ? chats : [])
+    .map((item) => normalizeStoredMatchChat(item))
+    .filter(Boolean)
+    .slice(-Math.max(1, limit));
+  if (rows.length === 0) return "（暂无历史对话）";
+  return rows
+    .map((row) => {
+      const role = normalizeMatchMessageType(row.type) === "voice" ? "语音" : "聊天";
+      return `${row.playerName}: ${row.message} [${role}]`;
+    })
+    .join("\n");
+}
+
+async function generateSecondMeReplies(accessToken, match, sender, message, messageType, recentChats = []) {
   const others = (match?.players || []).filter((p) => String(p.id) !== String(sender?.id));
   if (!accessToken || others.length === 0) return [];
   const otherPlayersText = others.map((p) => `- id=${p.id}, name=${p.name || "玩家"}`).join("\n");
+  const dialogueContext = buildRecentDialogueForKernel(recentChats, 8);
   const prompt = `你在神话卡牌对战里扮演多个玩家，帮我生成简短回复。
 当前说话者：${sender?.name || "玩家"}（id=${sender?.id || ""}）
 消息类型：${normalizeMatchMessageType(messageType) === "voice" ? "语音" : "聊天"}
 内容：${String(message || "").slice(0, 120)}
+最近对话：
+${dialogueContext}
 
 其他可回复玩家（只能从这些玩家里选）：
 ${otherPlayersText}
@@ -5664,28 +5744,18 @@ ${otherPlayersText}
 要求：回复口吻像在线对战队友，20字以内，不要解释，不要额外文本。`;
 
   try {
-    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
+    const kernel = await callSecondMeChatKernel(accessToken, [
+      {
+        role: "system",
+        content: "你是神话卡牌对战中的多玩家聊天助手，只输出 JSON 数组。",
       },
-      body: JSON.stringify({
-        messages: [
-          {
-            role: "system",
-            content: "你是神话卡牌对战中的多玩家聊天助手，只输出 JSON 数组。",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
-    const json = await resp.json().catch(() => null);
-    if (!resp.ok || !json || json.code !== 0 || !json.data?.content) return [];
-    const rows = parseSecondMeReplyArray(json.data.content);
+      {
+        role: "user",
+        content: prompt,
+      },
+    ]);
+    if (!kernel.ok) return [];
+    const rows = parseSecondMeReplyArray(kernel.content);
     if (!Array.isArray(rows) || rows.length === 0) return [];
     const allowed = new Set(others.map((p) => String(p.id)));
     const mapped = rows
@@ -6202,9 +6272,13 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
   }
   
   const matchId = req.params.matchId;
-  const { message, playerId: requestPlayerId, messageType, skipAutoReply } = req.body || {};
-  
-  if (!message || typeof message !== "string" || message.trim().length === 0) {
+  const { playerId: requestPlayerId, skipAutoReply } = req.body || {};
+  const normalizedPayload = sanitizeMatchMessagePayload(req.body || {});
+  const message = normalizedPayload.message;
+  const messageType = normalizedPayload.messageType;
+  const voiceMeta = normalizedPayload.voiceMeta;
+
+  if (!message || message.length === 0) {
     res.status(400).json({ ok: false, error: "invalid_message" });
     return;
   }
@@ -6231,11 +6305,12 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
   }
   
   const accessToken = session.token.accessToken;
-  const incomingMessage = createMatchChatMessage(player, message, messageType || "chat", {
+  const incomingMessage = createMatchChatMessage(player, message, messageType, {
     origin: requestPlayerId ? "actor_message" : "player_message",
+    voiceMeta,
   });
 
-  await getMatchChats(matchId, accessToken, { forceSync: true });
+  const baseChats = await getMatchChats(matchId, accessToken, { forceSync: true });
 
   const shouldReply = !Boolean(skipAutoReply);
   let autoReplies = [];
@@ -6245,7 +6320,8 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
       match,
       player,
       incomingMessage.message,
-      incomingMessage.type
+      incomingMessage.type,
+      baseChats
     );
     if (autoReplies.length === 0) {
       autoReplies = buildFallbackReplies(match, player, incomingMessage.message, incomingMessage.type);
@@ -6347,29 +6423,19 @@ app.post("/api/secondme/think", async (req, res) => {
   "reason": "你做出这个决策的原因"
 }`;
 
-    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
+    const kernel = await callSecondMeChatKernel(accessToken, [
+      {
+        role: "system",
+        content: "你是一个卡牌游戏专家，擅长分析游戏状态并做出最佳决策。请严格按照JSON格式返回决策结果。",
       },
-      body: JSON.stringify({
-        messages: [
-          {
-            role: "system",
-            content: "你是一个卡牌游戏专家，擅长分析游戏状态并做出最佳决策。请严格按照JSON格式返回决策结果。",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
+      {
+        role: "user",
+        content: prompt,
+      },
+    ]);
     
-    const json = await resp.json().catch(() => null);
-    if (resp.ok && json && json.code === 0 && json.data?.content) {
-      const content = json.data.content;
+    if (kernel.ok) {
+      const content = kernel.content;
       
       let structuredDecision = null;
       try {

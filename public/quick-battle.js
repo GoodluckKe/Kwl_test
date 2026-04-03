@@ -1769,7 +1769,7 @@
           const messageId = String(chat.id || `voice_${chat.timestamp || Date.now()}`);
           const isSelf = String(chat.playerId) === String(state.humanPlayerId);
           const time = new Date(chat.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-          const duration = inferVoiceDuration(chat.message);
+          const duration = Number(chat?.voiceMeta?.durationSec || 0) || inferVoiceDuration(chat.message);
           if (!voiceMessagesData[messageId] || voiceMessagesData[messageId].type !== "recorded") {
             voiceMessagesData[messageId] = {
               text: chat.message,
@@ -1938,7 +1938,14 @@
             const resp = await fetch(`/api/match/${matchId}/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text, messageType: "voice" }),
+              body: JSON.stringify({
+                message: text,
+                messageType: "voice",
+                voiceMeta: {
+                  durationSec: inferVoiceDuration(text),
+                  source: "text_to_speech",
+                },
+              }),
             });
             const json = await resp.json().catch(() => null);
             if (json?.ok) {
@@ -1990,7 +1997,14 @@
                 const resp = await fetch(`/api/match/${matchId}/chat`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ message: voiceText, messageType: "voice" }),
+                  body: JSON.stringify({
+                    message: voiceText,
+                    messageType: "voice",
+                    voiceMeta: {
+                      durationSec: duration,
+                      source: "recorded_audio",
+                    },
+                  }),
                 });
                 const json = await resp.json().catch(() => null);
                 if (json?.ok && json.message?.id) {
