@@ -244,8 +244,8 @@ async function generateHeroImages() {
   for (const [heroName, heroData] of Object.entries(HERO_ART_META)) {
     console.log(`正在生成 ${heroName} 的图像...`);
     
-    // 生成提示词
-    const prompt = `神话英雄 ${heroName}，${heroData.culture}，${heroData.lore}，${heroData.posterLine}，史诗风格，4K，高质量，动漫风格`;
+    // 生成提示词，深度展现人物性格特征
+    const prompt = `神话英雄 ${heroName}，${heroData.culture}，${heroData.lore}，${heroData.posterLine}，史诗风格，4K，高质量，动漫风格，面部表情丰富，眼神生动，发型和服饰细节精致，色彩搭配符合人物性格，背景元素与人物故事高度契合，展现人物的复杂性格特质，让观者能直观感受到角色的性格特点、身份背景及核心特质`;
     
     // 生成图像 URL
     const encodedPrompt = encodeURIComponent(prompt);

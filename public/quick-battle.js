@@ -171,6 +171,7 @@
           suitLabel: suitInfo.label,
           color: suitInfo.color,
           rank: suitInfo.rank,
+          avatar: def.avatar || `/card-images/${encodeURIComponent(def.newName)}.png`,
         });
       }
     });
@@ -1345,6 +1346,9 @@
         const suitClass = card.color === "red" ? "red" : "black";
         return `
           <div class="qb-hand-card ${selected} ${!state.waitingForHuman && !REACTION_ONLY.has(card.name) ? "disabled" : ""}" data-card-uid="${card.uid}">
+            <div class="qb-card-avatar">
+              <img src="${card.avatar}" alt="${card.name}" loading="lazy" decoding="async" />
+            </div>
             <div class="qb-card-top">
               <span class="qb-card-suit ${suitClass}">${card.suitLabel}${card.rank}</span>
               <span>${card.category}</span>

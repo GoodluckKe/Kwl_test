@@ -9,11 +9,23 @@ const isVercel = process.env.VERCEL === '1';
 // 在 Vercel 环境中不导入 sqlite3
 let sqlite3 = null;
 let open = null;
-if (!isVercel) {
-  sqlite3 = require("sqlite3");
-  const sqliteModule = require("sqlite");
-  open = sqliteModule.open;
+
+// 延迟导入 sqlite3，避免在 Vercel 环境中加载
+async function loadSqlite() {
+  if (!isVercel) {
+    try {
+      const sqlite3Module = await import("sqlite3");
+      const sqliteModule = await import("sqlite");
+      sqlite3 = sqlite3Module.default;
+      open = sqliteModule.open;
+    } catch (error) {
+      console.error("加载 sqlite 模块失败:", error);
+    }
+  }
 }
+
+// 加载 sqlite 模块
+loadSqlite();
 
 if (fs.existsSync(".env.local")) {
   dotenv.config({ path: ".env.local" });
@@ -35,9 +47,6 @@ const SESSION_TTL_SEC = 60 * 60 * 24 * 30;
 const redisEnabled = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 const SESSION_COOKIE_NAME = "session_data";
 
-// 检查是否在 Vercel 环境中
-const isVercel = process.env.VERCEL === '1';
-
 // 历史记录存储路径
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const BATTLE_HISTORY_DIR = path.join(__dirname, 'data', 'battle-history');
@@ -57,6 +66,16 @@ async function initDatabase() {
   }
   
   try {
+    // 确保 sqlite 模块已加载
+    if (!sqlite3 || !open) {
+      await loadSqlite();
+      // 再次检查
+      if (!sqlite3 || !open) {
+        console.error("sqlite 模块加载失败，无法初始化数据库");
+        return;
+      }
+    }
+    
     // 确保历史记录存储目录存在
     if (!fs.existsSync(BATTLE_HISTORY_DIR)) {
       fs.mkdirSync(BATTLE_HISTORY_DIR, { recursive: true });
@@ -1396,8 +1415,9 @@ function buildHeroAvatarSvg(heroName, factionName, title = "", skill = "") {
 }
 
 function getHeroAvatar(heroName, factionName, title, skill) {
-  // 使用预生成的高质量PNG人物头像
-  return `/hero-images/${heroName}.png`;
+  // 使用预生成的高质量PNG人物头像，添加时间戳避免缓存
+  const timestamp = Date.now();
+  return `/hero-images/${heroName}.png?ts=${timestamp}`;
 }
 
 function getCardTacticLabel(cardName, effect, category) {
@@ -5526,7 +5546,7 @@ app.get("/match", async (req, res) => {
     </head>
     <body>
       <div class="match-container">
-        <img class="match-logo" src="/shenji-logo.png" alt="神迹对决" />
+        <img class="match-logo" src="/assets/bg-myth-war.png" alt="神迹对决" />
         <h1 class="match-title">神迹对决</h1>
         <p class="match-subtitle">正在寻找对手...</p>
         <div class="match-spinner"></div>

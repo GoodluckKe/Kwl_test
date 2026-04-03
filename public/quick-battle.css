@@ -522,6 +522,24 @@ body::before {
   cursor: pointer;
 }
 
+.qb-card-avatar {
+  width: 100%;
+  height: 60px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(10, 14, 22, 0.6);
+}
+
+.qb-card-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  image-rendering: -webkit-optimize-contrast;
+  transform: translateZ(0);
+  filter: saturate(1.06) contrast(1.04);
+}
+
 .qb-hand-card.selected {
   border-color: rgba(245, 193, 79, 0.45);
   box-shadow: 0 0 0 2px rgba(245, 193, 79, 0.18);
