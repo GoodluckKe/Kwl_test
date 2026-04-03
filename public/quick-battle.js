@@ -1545,37 +1545,160 @@
     });
     refs.refreshBtn.addEventListener("click", () => window.location.reload());
     
-    // 聊天功能
+    // 聊天与语音统一消息流（SecondMe 存储）
+    const urlParams = new URLSearchParams(window.location.search);
+    const matchId = urlParams.get("matchId");
+    const voiceMessagesData = {};
+    let currentAudio = null;
+    let currentAudioId = null;
+
+    function escapeChatHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function formatVoiceDuration(seconds) {
+      const sec = Math.max(1, Number(seconds) || 3);
+      const min = Math.floor(sec / 60);
+      const rest = sec % 60;
+      return `${min}:${rest < 10 ? "0" : ""}${rest}`;
+    }
+
+    function inferVoiceDuration(message) {
+      const match = String(message || "").match(/(\d+)\s*秒/);
+      return match ? Math.max(1, Number(match[1]) || 3) : 3;
+    }
+
+    function renderChatMessages(chats) {
+      if (!refs.chatMessages) return;
+      if (!Array.isArray(chats) || chats.length === 0) {
+        refs.chatMessages.innerHTML =
+          '<div style="text-align: center; color: #64748b; font-size: 12px;">暂无聊天消息</div>';
+        return;
+      }
+      refs.chatMessages.innerHTML = chats
+        .map((chat) => {
+          const time = new Date(chat.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+          const isSelf = String(chat.playerId) === String(state.humanPlayerId);
+          const type = String(chat.type || "chat");
+          const voiceMark =
+            type === "voice"
+              ? '<div style="font-size: 10px; color: #fbbf24; margin-top: 2px;">语音消息</div>'
+              : "";
+          return (
+            '<div style="display: flex; flex-direction: column; ' +
+            (isSelf ? "align-items: flex-end;" : "align-items: flex-start;") +
+            ';">' +
+            '<span style="font-size: 11px; color: #64748b;">' +
+            escapeChatHtml(chat.playerName) +
+            " " +
+            escapeChatHtml(time) +
+            "</span>" +
+            '<span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: ' +
+            (isSelf ? "rgba(251, 191, 36, 0.2);" : "rgba(59, 130, 246, 0.2);") +
+            ' color: #eef6ff; font-size: 13px; word-break: break-all;">' +
+            escapeChatHtml(chat.message) +
+            "</span>" +
+            voiceMark +
+            "</div>"
+          );
+        })
+        .join("");
+      refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
+    }
+
+    function renderVoiceMessages(chats) {
+      if (!refs.voiceMessages) return;
+      const voiceChats = (Array.isArray(chats) ? chats : []).filter((chat) => String(chat.type || "chat") === "voice");
+      if (voiceChats.length === 0) {
+        refs.voiceMessages.innerHTML =
+          '<div style="text-align: center; color: #64748b; font-size: 12px;">暂无语音消息</div>';
+        return;
+      }
+
+      refs.voiceMessages.innerHTML = voiceChats
+        .map((chat) => {
+          const messageId = String(chat.id || `voice_${chat.timestamp || Date.now()}`);
+          const isSelf = String(chat.playerId) === String(state.humanPlayerId);
+          const time = new Date(chat.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+          const duration = inferVoiceDuration(chat.message);
+          if (!voiceMessagesData[messageId] || voiceMessagesData[messageId].type !== "recorded") {
+            voiceMessagesData[messageId] = {
+              text: chat.message,
+              type: "text-to-speech",
+              timestamp: chat.timestamp,
+              duration,
+            };
+          }
+          return (
+            '<div class="voice-message" data-voice-id="' +
+            escapeChatHtml(messageId) +
+            '" style="display: flex; flex-direction: column; ' +
+            (isSelf ? "align-items: flex-end;" : "align-items: flex-start;") +
+            ' cursor: pointer;">' +
+            '<span style="font-size: 11px; color: #64748b;">' +
+            escapeChatHtml(chat.playerName) +
+            " " +
+            escapeChatHtml(time) +
+            "</span>" +
+            '<span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: ' +
+            (isSelf ? "rgba(251, 191, 36, 0.2);" : "rgba(59, 130, 246, 0.2);") +
+            ' color: #eef6ff; font-size: 13px; word-break: break-all;">' +
+            escapeChatHtml(chat.message) +
+            '</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;">' +
+            '<span class="voice-status" style="font-size: 10px; color: #fbbf24;">▶</span>' +
+            '<span style="font-size: 10px; color: #fbbf24;">语音消息</span>' +
+            '<span class="voice-duration" style="font-size: 10px; color: #fbbf24;">' +
+            formatVoiceDuration(duration) +
+            "</span></div></div>"
+          );
+        })
+        .join("");
+      refs.voiceMessages.scrollTop = refs.voiceMessages.scrollHeight;
+    }
+
+    async function loadChatMessages() {
+      if (!matchId) return;
+      try {
+        const resp = await fetch(`/api/match/${matchId}/chat`);
+        const json = await resp.json().catch(() => null);
+        if (!json?.ok) return;
+        const chats = Array.isArray(json.chats) ? json.chats : [];
+        renderChatMessages(chats);
+        renderVoiceMessages(chats);
+      } catch (error) {
+        console.error("加载聊天消息失败:", error);
+      }
+    }
+
     if (refs.chatToggle && refs.chatPanel) {
-      const urlParams = new URLSearchParams(window.location.search);
-      const matchId = urlParams.get('matchId');
-      
       refs.chatToggle.addEventListener("click", () => {
         refs.chatPanel.style.display = refs.chatPanel.style.display === "none" ? "block" : "none";
-        if (refs.chatPanel.style.display === "block") {
-          loadChatMessages();
-        }
+        if (refs.chatPanel.style.display === "block") loadChatMessages();
       });
-      
+
       if (refs.chatClose) {
         refs.chatClose.addEventListener("click", () => {
           refs.chatPanel.style.display = "none";
         });
       }
-      
+
       if (refs.chatSend && refs.chatInput) {
         const sendMessage = async () => {
           const message = refs.chatInput.value.trim();
           if (!message || !matchId) return;
-          
           try {
             const resp = await fetch(`/api/match/${matchId}/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message })
+              body: JSON.stringify({ message, messageType: "chat" }),
             });
-            const json = await resp.json();
-            if (json.ok) {
+            const json = await resp.json().catch(() => null);
+            if (json?.ok) {
               refs.chatInput.value = "";
               loadChatMessages();
             }
@@ -1583,217 +1706,163 @@
             console.error("发送消息失败:", error);
           }
         };
-        
+
         refs.chatSend.addEventListener("click", sendMessage);
         refs.chatInput.addEventListener("keypress", (e) => {
           if (e.key === "Enter") sendMessage();
         });
       }
-      
-      async function loadChatMessages() {
-        if (!matchId || !refs.chatMessages) return;
-        
-        try {
-          const resp = await fetch(`/api/match/${matchId}/chat`);
-          const json = await resp.json();
-          
-          if (json.ok && json.chats && json.chats.length > 0) {
-            refs.chatMessages.innerHTML = json.chats.map(chat => {
-              const time = new Date(chat.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-              const isSelf = String(chat.playerId) === String(state.humanPlayerId);
-              return '<div style="display: flex; flex-direction: column; ' + (isSelf ? 'align-items: flex-end;' : 'align-items: flex-start;') + ';"><span style="font-size: 11px; color: #64748b;">' + chat.playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: ' + (isSelf ? 'rgba(251, 191, 36, 0.2);' : 'rgba(59, 130, 246, 0.2);') + '; color: #eef6ff; font-size: 13px; word-break: break-all;">' + chat.message + '</span></div>';
-            }).join('');
-            refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
-          }
-        } catch (error) {
-          console.error("加载聊天消息失败:", error);
-        }
-      }
-      
-      // 每2秒自动刷新聊天消息，确保实时通信
-      if (matchId) {
-        setInterval(() => {
-          loadChatMessages();
-        }, 2000);
-      }
-      
-      // 页面加载时立即加载聊天消息
-      loadChatMessages();
     }
-    
+
     // AI聊天功能
     async function sendAIChatMessage(actor) {
-      const urlParams = new URLSearchParams(window.location.search);
-      const matchId = urlParams.get('matchId');
       if (!matchId) return;
-      
-      // AI聊天消息模板
+
       const chatMessages = [
         `哈哈，${actor.hero.name}的力量无人能敌！`,
-        `你的策略太弱了，准备接受失败吧！`,
-        `看我如何运用这张卡牌击败你！`,
-        `我的阵营必将胜利！`,
-        `你以为这样就能打败我吗？`,
-        `小心了，我的回合才刚刚开始！`,
-        `这张卡牌将改变战局！`,
-        `你的防御不堪一击！`,
-        `胜利属于我！`,
-        `感受${actor.hero.name}的怒火吧！`
+        "你的策略太弱了，准备接受失败吧！",
+        "看我如何运用这张卡牌击败你！",
+        "我的阵营必将胜利！",
+        "你以为这样就能打败我吗？",
+        "小心了，我的回合才刚刚开始！",
+        "这张卡牌将改变战局！",
+        "你的防御不堪一击！",
+        "胜利属于我！",
+        `感受${actor.hero.name}的怒火吧！`,
       ];
-      
-      // 随机选择一条消息
+
       const randomMessage = chatMessages[Math.floor(Math.random() * chatMessages.length)];
-      
+
       try {
-        // 发送消息到聊天
         const resp = await fetch(`/api/match/${matchId}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: randomMessage, playerId: actor.id })
+          body: JSON.stringify({ message: randomMessage, playerId: actor.id, messageType: "chat", skipAutoReply: true }),
         });
-        
-        const json = await resp.json();
-        if (json.ok) {
-          // 消息发送成功，自动刷新聊天
-          loadChatMessages();
-        }
+
+        const json = await resp.json().catch(() => null);
+        if (json?.ok) loadChatMessages();
       } catch (error) {
         console.error("AI发送消息失败:", error);
       }
     }
-    
+
+    function stopCurrentVoicePlayback() {
+      if (currentAudio instanceof Audio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      } else if (currentAudio instanceof SpeechSynthesisUtterance && "speechSynthesis" in window) {
+        speechSynthesis.cancel();
+      }
+      if (currentAudioId) {
+        const currentMessage = document.querySelector('[data-voice-id="' + currentAudioId + '"]');
+        if (currentMessage) {
+          const statusElement = currentMessage.querySelector(".voice-status");
+          if (statusElement) statusElement.textContent = "▶";
+        }
+      }
+      currentAudio = null;
+      currentAudioId = null;
+    }
+
     // 语音功能
     if (refs.voiceToggle && refs.voicePanel) {
-      const urlParams = new URLSearchParams(window.location.search);
-      const matchId = urlParams.get('matchId');
-      
-      // 语音消息存储
-      const voiceMessagesData = {};
-      let currentAudio = null;
-      let currentAudioId = null;
-      
       refs.voiceToggle.addEventListener("click", () => {
         refs.voicePanel.style.display = refs.voicePanel.style.display === "none" ? "block" : "none";
+        if (refs.voicePanel.style.display === "block") loadChatMessages();
       });
-      
+
       if (refs.voiceClose) {
         refs.voiceClose.addEventListener("click", () => {
           refs.voicePanel.style.display = "none";
         });
       }
-      
+
       if (refs.voiceSend && refs.voiceInput) {
         const sendVoiceMessage = async () => {
           const text = refs.voiceInput.value.trim();
           if (!text || !matchId) return;
-          
+
           try {
-            // 文字转语音
-            if ('speechSynthesis' in window) {
+            if ("speechSynthesis" in window) {
               const utterance = new SpeechSynthesisUtterance(text);
-              utterance.lang = 'zh-CN';
+              utterance.lang = "zh-CN";
               utterance.volume = 0.8;
               speechSynthesis.speak(utterance);
             }
-            
-            // 发送文本消息到聊天
+
             const resp = await fetch(`/api/match/${matchId}/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text })
+              body: JSON.stringify({ message: text, messageType: "voice" }),
             });
-            const json = await resp.json();
-            if (json.ok) {
+            const json = await resp.json().catch(() => null);
+            if (json?.ok) {
               refs.voiceInput.value = "";
-              // 生成唯一ID
-              const messageId = 'voice_' + Date.now();
-              // 显示语音消息
-              if (refs.voiceMessages) {
-                const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-                const human = getPlayerById(state.humanPlayerId);
-                const playerName = human ? human.name : '玩家';
-                
-                const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">' + playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(251, 191, 36, 0.2); color: #eef6ff; font-size: 13px; word-break: break-all;">' + text + '</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span style="font-size: 10px; color: #fbbf24;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #fbbf24;">0:03</span></div></div>';
-                
-                if (refs.voiceMessages.innerHTML.includes('暂无语音消息')) {
-                  refs.voiceMessages.innerHTML = messageHTML;
-                } else {
-                  refs.voiceMessages.innerHTML += messageHTML;
-                }
-                refs.voiceMessages.scrollTop = refs.voiceMessages.scrollHeight;
+              const id = String(json.message?.id || "");
+              if (id) {
+                voiceMessagesData[id] = {
+                  text,
+                  timestamp: Date.now(),
+                  type: "text-to-speech",
+                  duration: inferVoiceDuration(text),
+                };
               }
-              
-              // 存储消息数据
-              voiceMessagesData[messageId] = {
-                text: text,
-                timestamp: Date.now(),
-                type: 'text-to-speech'
-              };
+              loadChatMessages();
             }
           } catch (error) {
             console.error("发送语音消息失败:", error);
           }
         };
-        
+
         refs.voiceSend.addEventListener("click", sendVoiceMessage);
         refs.voiceInput.addEventListener("keypress", (e) => {
           if (e.key === "Enter") sendVoiceMessage();
         });
       }
-      
-      // 语音录制功能
+
       if (refs.voiceRecord) {
         let mediaRecorder = null;
         let audioChunks = [];
         let startTime = 0;
-        
+
         refs.voiceRecord.addEventListener("mousedown", async () => {
           try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             mediaRecorder = new MediaRecorder(stream);
             audioChunks = [];
             startTime = Date.now();
-            
+
             mediaRecorder.ondataavailable = (event) => {
-              if (event.data.size > 0) {
-                audioChunks.push(event.data);
-              }
+              if (event.data.size > 0) audioChunks.push(event.data);
             };
-            
-            mediaRecorder.onstop = () => {
-              const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-              const duration = Math.round((Date.now() - startTime) / 1000);
-              
-              // 生成唯一ID
-              const messageId = 'voice_' + Date.now();
-              
-              // 显示语音消息
-              if (refs.voiceMessages) {
-                const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-                const human = getPlayerById(state.humanPlayerId);
-                const playerName = human ? human.name : '玩家';
-                
-                const messageHTML = '<div class="voice-message" data-voice-id="' + messageId + '" style="display: flex; flex-direction: column; align-items: flex-end; cursor: pointer;"><span style="font-size: 11px; color: #64748b;">' + playerName + ' ' + time + '</span><span style="max-width: 200px; padding: 6px 10px; border-radius: 8px; background: rgba(251, 191, 36, 0.2); color: #eef6ff; font-size: 13px; word-break: break-all;">语音消息</span><div style="display: flex; align-items: center; gap: 6px; margin-top: 2px;"><span class="voice-status" style="font-size: 10px; color: #fbbf24;">▶</span><span style="font-size: 10px; color: #fbbf24;">语音消息</span><span class="voice-duration" style="font-size: 10px; color: #fbbf24;">0:' + (duration < 10 ? '0' + duration : duration) + '</span></div></div>';
-                
-                if (refs.voiceMessages.innerHTML.includes('暂无语音消息')) {
-                  refs.voiceMessages.innerHTML = messageHTML;
-                } else {
-                  refs.voiceMessages.innerHTML += messageHTML;
+
+            mediaRecorder.onstop = async () => {
+              const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+              const duration = Math.max(1, Math.round((Date.now() - startTime) / 1000));
+              const voiceText = `语音消息（${duration}秒）`;
+              if (!matchId) return;
+              try {
+                const resp = await fetch(`/api/match/${matchId}/chat`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ message: voiceText, messageType: "voice" }),
+                });
+                const json = await resp.json().catch(() => null);
+                if (json?.ok && json.message?.id) {
+                  voiceMessagesData[String(json.message.id)] = {
+                    blob: audioBlob,
+                    duration,
+                    timestamp: Date.now(),
+                    type: "recorded",
+                  };
                 }
-                refs.voiceMessages.scrollTop = refs.voiceMessages.scrollHeight;
+                loadChatMessages();
+              } catch (error) {
+                console.error("上传录音消息失败:", error);
               }
-              
-              // 存储消息数据
-              voiceMessagesData[messageId] = {
-                blob: audioBlob,
-                duration: duration,
-                timestamp: Date.now(),
-                type: 'recorded'
-              };
-              
-              console.log('语音录制完成', audioBlob);
             };
-            
+
             mediaRecorder.start();
             refs.voiceRecord.textContent = "录制中...";
             refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.3)";
@@ -1801,107 +1870,71 @@
             console.error("语音录制失败:", error);
           }
         });
-        
-        refs.voiceRecord.addEventListener("mouseup", () => {
+
+        function stopRecorderIfNeeded() {
           if (mediaRecorder && mediaRecorder.state === "recording") {
             mediaRecorder.stop();
-            // 停止所有音频轨道
-            mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            mediaRecorder.stream.getTracks().forEach((track) => track.stop());
             refs.voiceRecord.textContent = "按住说话";
             refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
           }
-        });
-        
-        // 处理鼠标移出按钮的情况
-        refs.voiceRecord.addEventListener("mouseleave", () => {
-          if (mediaRecorder && mediaRecorder.state === "recording") {
-            mediaRecorder.stop();
-            mediaRecorder.stream.getTracks().forEach(track => track.stop());
-            refs.voiceRecord.textContent = "按住说话";
-            refs.voiceRecord.style.background = "rgba(248, 113, 113, 0.2)";
-          }
-        });
+        }
+
+        refs.voiceRecord.addEventListener("mouseup", stopRecorderIfNeeded);
+        refs.voiceRecord.addEventListener("mouseleave", stopRecorderIfNeeded);
       }
-      
-      // 语音消息播放功能
+
       if (refs.voiceMessages) {
-        refs.voiceMessages.addEventListener("click", function (event) {
-          const voiceMessage = event.target.closest('.voice-message');
+        refs.voiceMessages.addEventListener("click", (event) => {
+          const voiceMessage = event.target.closest(".voice-message");
           if (!voiceMessage) return;
-          
-          const messageId = voiceMessage.dataset.voiceId;
+
+          const messageId = String(voiceMessage.dataset.voiceId || "");
           const messageData = voiceMessagesData[messageId];
           if (!messageData) return;
-          
-          // 停止当前播放的音频
-          if (currentAudio) {
-            currentAudio.pause();
-            currentAudio.currentTime = 0;
-            if (currentAudioId) {
-              const currentMessage = document.querySelector('[data-voice-id="' + currentAudioId + '"]');
-              if (currentMessage) {
-                const statusElement = currentMessage.querySelector('.voice-status');
-                if (statusElement) {
-                  statusElement.textContent = '▶';
-                }
-              }
-            }
-          }
-          
-          // 如果点击的是当前正在播放的音频，则停止
+
           if (currentAudioId === messageId) {
-            currentAudio = null;
-            currentAudioId = null;
+            stopCurrentVoicePlayback();
             return;
           }
-          
-          // 播放新的音频
-          if (messageData.type === 'recorded' && messageData.blob) {
+
+          stopCurrentVoicePlayback();
+
+          if (messageData.type === "recorded" && messageData.blob) {
             currentAudio = new Audio(URL.createObjectURL(messageData.blob));
-          } else if (messageData.type === 'text-to-speech' && messageData.text) {
-            currentAudio = new SpeechSynthesisUtterance(messageData.text);
-            currentAudio.lang = 'zh-CN';
-            currentAudio.volume = 0.8;
+          } else if (messageData.text && "speechSynthesis" in window) {
+            const utterance = new SpeechSynthesisUtterance(messageData.text);
+            utterance.lang = "zh-CN";
+            utterance.volume = 0.8;
+            currentAudio = utterance;
+          } else {
+            return;
           }
-          
-          if (currentAudio) {
-            currentAudioId = messageId;
-            
-            // 更新播放状态
-            const statusElement = voiceMessage.querySelector('.voice-status');
-            if (statusElement) {
-              statusElement.textContent = '⏸';
-            }
-            
-            // 播放完成处理
-            if (currentAudio instanceof Audio) {
-              currentAudio.onended = function () {
-                if (currentAudioId === messageId) {
-                  const statusElement = voiceMessage.querySelector('.voice-status');
-                  if (statusElement) {
-                    statusElement.textContent = '▶';
-                  }
-                  currentAudio = null;
-                  currentAudioId = null;
-                }
-              };
-              currentAudio.play();
-            } else if (currentAudio instanceof SpeechSynthesisUtterance) {
-              currentAudio.onend = function () {
-                if (currentAudioId === messageId) {
-                  const statusElement = voiceMessage.querySelector('.voice-status');
-                  if (statusElement) {
-                    statusElement.textContent = '▶';
-                  }
-                  currentAudio = null;
-                  currentAudioId = null;
-                }
-              };
-              speechSynthesis.speak(currentAudio);
-            }
+
+          currentAudioId = messageId;
+          const statusElement = voiceMessage.querySelector(".voice-status");
+          if (statusElement) statusElement.textContent = "⏸";
+
+          if (currentAudio instanceof Audio) {
+            currentAudio.onended = () => {
+              if (currentAudioId === messageId) stopCurrentVoicePlayback();
+            };
+            currentAudio.play();
+          } else if (currentAudio instanceof SpeechSynthesisUtterance) {
+            currentAudio.onend = () => {
+              if (currentAudioId === messageId) stopCurrentVoicePlayback();
+            };
+            speechSynthesis.speak(currentAudio);
           }
         });
       }
+    }
+
+    if (matchId) {
+      setInterval(() => {
+        loadChatMessages();
+      }, 2000);
+      loadChatMessages();
     }
     
     if (refs.resultRestartBtn) {

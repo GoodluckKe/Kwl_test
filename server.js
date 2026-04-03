@@ -117,6 +117,11 @@ const RANK_STEP_EXP = 100;
 const RANK_GAIN_WIN = 20;
 const RANK_GAIN_LOSS = -10;
 const RANK_INITIAL_EXP = 60;
+const SECONDME_RANK_PROGRESS_KEY = "rank_progress";
+const SECONDME_MATCH_CHAT_KEY_PREFIX = "match_chat_";
+const MATCH_CHAT_MAX_MESSAGES = 120;
+const MATCH_CHAT_SYNC_INTERVAL_MS = 5000;
+const MATCH_CHAT_RANDOM_SPEAK_INTERVAL_MS = 8000;
 const RANK_TIERS = [
   { name: "凡尘行者", title: "初入神迹" },
   { name: "山海游侠", title: "行过四海" },
@@ -1572,9 +1577,8 @@ function buildCardAvatarSvg(cardName, category, subType = "", effect = "") {
 }
 
 function getCardAvatar(cardName, category, subType, effect) {
-  // 直接使用SVG数据URL作为头像
-  const svg = buildCardAvatarSvg(cardName, category, subType, effect);
-  return "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64");
+  // 与对战页统一：优先使用本地卡牌图片资源
+  return `/card-images/${encodeURIComponent(cardName)}.png`;
 }
 
 function battleSceneArt(meta, t) {
@@ -1787,6 +1791,84 @@ async function fetchSecondMeUser(accessToken) {
   }
 }
 
+function rankProgressFromStoredValue(value) {
+  if (value === null || value === undefined) return null;
+  let parsed = value;
+  if (typeof parsed === "string") {
+    const text = parsed.trim();
+    if (!text) return null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      const numeric = Number(text);
+      if (!Number.isFinite(numeric)) return null;
+      parsed = { score: numeric };
+    }
+  }
+  if (typeof parsed === "number") parsed = { score: parsed };
+  if (!parsed || typeof parsed !== "object") return null;
+  const score = Number(parsed.score);
+  if (!Number.isFinite(score)) return null;
+  const rankProgress = createRankProgress(score);
+  const updatedAt = Number(parsed.updatedAt);
+  if (Number.isFinite(updatedAt) && updatedAt > 0) {
+    rankProgress.updatedAt = updatedAt;
+  }
+  return rankProgress;
+}
+
+async function loadRankProgressFromSecondMe(accessToken) {
+  if (!accessToken) return null;
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !Array.isArray(json.data)) {
+      return null;
+    }
+    const rankEntry = json.data.find(
+      (item) => item?.key === SECONDME_RANK_PROGRESS_KEY || item?.key === "rankProgress"
+    );
+    if (!rankEntry) return null;
+    return rankProgressFromStoredValue(rankEntry.value);
+  } catch (error) {
+    console.error("从 SecondMe Key Memory 加载段位出错:", error);
+    return null;
+  }
+}
+
+async function saveRankProgressToSecondMe(accessToken, rankProgress) {
+  if (!accessToken || !rankProgress) return false;
+  try {
+    const payload = {
+      score: Math.max(0, Number(rankProgress.score) || 0),
+      updatedAt: Number(rankProgress.updatedAt) || Date.now(),
+    };
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key: SECONDME_RANK_PROGRESS_KEY,
+        value: payload,
+        timestamp: Date.now(),
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (resp.ok && json && json.code === 0) return true;
+    console.error("保存段位到 SecondMe Key Memory 失败:", json || resp.statusText);
+    return false;
+  } catch (error) {
+    console.error("保存段位到 SecondMe Key Memory 出错:", error);
+    return false;
+  }
+}
+
 function getBearerToken(req) {
   const raw = String(req.headers.authorization || "");
   if (!raw.startsWith("Bearer ")) return "";
@@ -1935,7 +2017,11 @@ async function runIntegrationTool(req, tool, input) {
   }
 
   const linkedSession = await findStoredSessionByUser(upstreamUser);
-  const rankProgress = linkedSession?.rankProgress || createRankProgress();
+  let rankProgress = linkedSession?.rankProgress || createRankProgress();
+  if (!linkedSession) {
+    const remoteRankProgress = await loadRankProgressFromSecondMe(accessToken);
+    if (remoteRankProgress) rankProgress = remoteRankProgress;
+  }
   const baseUrl = getAppBaseUrl(req);
 
   if (normalizedTool === "get_player_profile") {
@@ -4514,6 +4600,292 @@ const matchQueue = new Set();
 const activeMatches = new Map();
 const matchChats = new Map();
 const userMatchTimers = new Map();
+const matchChatLastSyncedAt = new Map();
+const matchChatLastAmbientAt = new Map();
+
+const MATCH_CHAT_REPLY_TEMPLATES = [
+  "收到，我这边马上配合。",
+  "这波可以，继续压制。",
+  "我在看你这边的节奏，稳住就能赢。",
+  "这个点打得不错，我来跟上。",
+  "注意资源，我这边先保留关键牌。",
+  "你这句提醒很及时，谢了。",
+];
+
+const MATCH_VOICE_REPLY_TEMPLATES = [
+  "我听到了，马上行动。",
+  "语音收到，这回合我来补位。",
+  "战术清楚了，我们继续推进。",
+  "好，按你说的节奏来。",
+  "明白，我这边准备接应。",
+];
+
+const MATCH_CHAT_AMBIENT_TEMPLATES = [
+  "我这回合手牌一般，先观望。",
+  "注意一下场上血线，别被反打。",
+  "我感觉下一轮可以冲一波。",
+  "对面这张牌有点危险，别大意。",
+  "我这边准备了一张关键牌。",
+  "节奏在我们这边，继续保持。",
+];
+
+const MATCH_VOICE_AMBIENT_TEMPLATES = [
+  "语音提醒：先保命再输出。",
+  "语音提醒：我下一手会补控制。",
+  "语音提醒：别急着交全部资源。",
+  "语音提醒：先把残血目标收掉。",
+  "语音提醒：我这边可以先扛伤害。",
+];
+
+function randomItem(list) {
+  if (!Array.isArray(list) || list.length === 0) return "";
+  return list[Math.floor(Math.random() * list.length)] || "";
+}
+
+function normalizeMatchMessageType(type) {
+  return String(type || "").toLowerCase() === "voice" ? "voice" : "chat";
+}
+
+function createMatchChatMessage(player, text, type = "chat", extra = {}) {
+  const message = String(text || "").trim().slice(0, 200);
+  return {
+    id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    playerId: String(player?.id || ""),
+    playerName: String(player?.name || "玩家"),
+    message,
+    type: normalizeMatchMessageType(type),
+    timestamp: Date.now(),
+    origin: String(extra.origin || "player"),
+  };
+}
+
+function normalizeStoredMatchChat(item) {
+  if (!item || typeof item !== "object") return null;
+  const message = String(item.message || item.content || "").trim().slice(0, 200);
+  if (!message) return null;
+  const timestamp = Number(item.timestamp);
+  return {
+    id: String(item.id || `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+    playerId: String(item.playerId || item.userId || ""),
+    playerName: String(item.playerName || item.name || "玩家"),
+    message,
+    type: normalizeMatchMessageType(item.type || item.messageType),
+    timestamp: Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now(),
+    origin: String(item.origin || "player"),
+  };
+}
+
+function parseMatchChatValue(value) {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    const text = parsed.trim();
+    if (!text) return [];
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return [];
+    }
+  }
+  let rows = [];
+  if (Array.isArray(parsed)) rows = parsed;
+  if (!rows.length && parsed && typeof parsed === "object" && Array.isArray(parsed.messages)) {
+    rows = parsed.messages;
+  }
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((item) => normalizeStoredMatchChat(item))
+    .filter(Boolean)
+    .slice(-MATCH_CHAT_MAX_MESSAGES);
+}
+
+function buildMatchChatKey(matchId) {
+  return `${SECONDME_MATCH_CHAT_KEY_PREFIX}${String(matchId || "").slice(0, 96)}`;
+}
+
+async function loadMatchChatsFromSecondMe(accessToken, matchId) {
+  if (!accessToken || !matchId) return null;
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !Array.isArray(json.data)) return null;
+    const chatEntry = json.data.find((item) => item?.key === buildMatchChatKey(matchId));
+    if (!chatEntry) return [];
+    return parseMatchChatValue(chatEntry.value);
+  } catch (error) {
+    console.error("加载对战聊天记录失败:", error);
+    return null;
+  }
+}
+
+async function saveMatchChatsToSecondMe(accessToken, matchId, chats) {
+  if (!accessToken || !matchId) return false;
+  try {
+    const payload = parseMatchChatValue(chats);
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/key-memory`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key: buildMatchChatKey(matchId),
+        value: payload,
+        timestamp: Date.now(),
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0) {
+      console.error("保存对战聊天记录失败:", json || resp.statusText);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("保存对战聊天记录出错:", error);
+    return false;
+  }
+}
+
+async function getMatchChats(matchId, accessToken, options = {}) {
+  if (!matchChats.has(matchId)) matchChats.set(matchId, []);
+  const localChats = matchChats.get(matchId) || [];
+  const lastSync = Number(matchChatLastSyncedAt.get(matchId) || 0);
+  const shouldSync =
+    Boolean(accessToken) &&
+    (options.forceSync || localChats.length === 0 || Date.now() - lastSync >= MATCH_CHAT_SYNC_INTERVAL_MS);
+
+  if (shouldSync) {
+    const remoteChats = await loadMatchChatsFromSecondMe(accessToken, matchId);
+    if (remoteChats !== null) {
+      matchChats.set(matchId, remoteChats);
+      matchChatLastSyncedAt.set(matchId, Date.now());
+    }
+  }
+  return matchChats.get(matchId) || [];
+}
+
+async function appendMatchChats(matchId, accessToken, newMessages) {
+  const base = await getMatchChats(matchId, accessToken);
+  const normalized = (Array.isArray(newMessages) ? newMessages : [])
+    .map((item) => normalizeStoredMatchChat(item))
+    .filter(Boolean);
+  if (normalized.length === 0) return base;
+  const merged = base.concat(normalized).slice(-MATCH_CHAT_MAX_MESSAGES);
+  matchChats.set(matchId, merged);
+  matchChatLastSyncedAt.set(matchId, Date.now());
+  await saveMatchChatsToSecondMe(accessToken, matchId, merged);
+  return merged;
+}
+
+function parseSecondMeReplyArray(content) {
+  if (!content || typeof content !== "string") return [];
+  const candidates = [];
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) candidates.push(fenced[1]);
+  candidates.push(content);
+  for (const raw of candidates) {
+    const arrayMatch = raw.match(/\[[\s\S]*\]/);
+    const attempt = arrayMatch ? arrayMatch[0] : raw;
+    try {
+      const parsed = JSON.parse(attempt);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return [];
+}
+
+async function generateSecondMeReplies(accessToken, match, sender, message, messageType) {
+  const others = (match?.players || []).filter((p) => String(p.id) !== String(sender?.id));
+  if (!accessToken || others.length === 0) return [];
+  const otherPlayersText = others.map((p) => `- id=${p.id}, name=${p.name || "玩家"}`).join("\n");
+  const prompt = `你在神话卡牌对战里扮演多个玩家，帮我生成简短回复。
+当前说话者：${sender?.name || "玩家"}（id=${sender?.id || ""}）
+消息类型：${normalizeMatchMessageType(messageType) === "voice" ? "语音" : "聊天"}
+内容：${String(message || "").slice(0, 120)}
+
+其他可回复玩家（只能从这些玩家里选）：
+${otherPlayersText}
+
+请输出 1 到 2 条回复，格式必须是 JSON 数组，数组元素格式：
+{"playerId":"玩家id","type":"chat或voice","message":"回复内容"}
+要求：回复口吻像在线对战队友，20字以内，不要解释，不要额外文本。`;
+
+  try {
+    const resp = await fetch(`${SECONDME_API_BASE_URL}/api/secondme/agent/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "system",
+            content: "你是神话卡牌对战中的多玩家聊天助手，只输出 JSON 数组。",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json || json.code !== 0 || !json.data?.content) return [];
+    const rows = parseSecondMeReplyArray(json.data.content);
+    if (!Array.isArray(rows) || rows.length === 0) return [];
+    const allowed = new Set(others.map((p) => String(p.id)));
+    const mapped = rows
+      .map((item) => {
+        const playerId = String(item?.playerId || "");
+        if (!allowed.has(playerId)) return null;
+        const player = others.find((p) => String(p.id) === playerId);
+        const text = String(item?.message || "").trim().slice(0, 200);
+        if (!text) return null;
+        return createMatchChatMessage(player, text, item?.type || "chat", { origin: "secondme_reply" });
+      })
+      .filter(Boolean)
+      .slice(0, 2);
+    return mapped;
+  } catch (error) {
+    console.error("SecondMe 自动回复生成失败:", error);
+    return [];
+  }
+}
+
+function buildFallbackReplies(match, sender, sourceMessage, sourceType) {
+  const others = (match?.players || []).filter((p) => String(p.id) !== String(sender?.id));
+  if (others.length === 0) return [];
+  const count = Math.min(others.length, 1 + Math.floor(Math.random() * 2));
+  const selected = [...others].sort(() => Math.random() - 0.5).slice(0, count);
+  const quote = String(sourceMessage || "").trim().slice(0, 10);
+  return selected.map((player, idx) => {
+    const isVoice = Math.random() < (normalizeMatchMessageType(sourceType) === "voice" ? 0.6 : 0.35);
+    const baseText = randomItem(isVoice ? MATCH_VOICE_REPLY_TEMPLATES : MATCH_CHAT_REPLY_TEMPLATES);
+    const replyText = idx === 0 && quote ? `${baseText}（${quote}）` : baseText;
+    return createMatchChatMessage(player, replyText, isVoice ? "voice" : "chat", { origin: "fallback_reply" });
+  });
+}
+
+function maybeBuildAmbientMessage(match, viewerId, matchId) {
+  const players = (match?.players || []).filter((p) => String(p.id) !== String(viewerId || ""));
+  if (players.length === 0) return null;
+  const now = Date.now();
+  const lastAt = Number(matchChatLastAmbientAt.get(matchId) || 0);
+  if (now - lastAt < MATCH_CHAT_RANDOM_SPEAK_INTERVAL_MS) return null;
+  if (Math.random() > 0.2) return null;
+  const speaker = randomItem(players);
+  const isVoice = Math.random() < 0.35;
+  const content = randomItem(isVoice ? MATCH_VOICE_AMBIENT_TEMPLATES : MATCH_CHAT_AMBIENT_TEMPLATES);
+  if (!content) return null;
+  matchChatLastAmbientAt.set(matchId, now);
+  return createMatchChatMessage(speaker, content, isVoice ? "voice" : "chat", { origin: "ambient" });
+}
 
 // 生成AI玩家
 function generateAIPlayers(count, userId, userName) {
@@ -4947,7 +5319,7 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
   }
   
   const matchId = req.params.matchId;
-  const { message, playerId: requestPlayerId } = req.body;
+  const { message, playerId: requestPlayerId, messageType, skipAutoReply } = req.body || {};
   
   if (!message || typeof message !== "string" || message.trim().length === 0) {
     res.status(400).json({ ok: false, error: "invalid_message" });
@@ -4964,10 +5336,10 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
   let player;
   if (requestPlayerId) {
     // 允许其他玩家或AI通过SecondMe发送消息
-    player = match.players.find(p => p.id === requestPlayerId);
+    player = match.players.find(p => String(p.id) === String(requestPlayerId));
   } else {
     // 默认使用当前会话用户
-    player = match.players.find(p => p.id === session.user.id);
+    player = match.players.find(p => String(p.id) === String(session.user.id));
   }
   
   if (!player) {
@@ -4975,28 +5347,30 @@ app.post("/api/match/:matchId/chat", async (req, res) => {
     return;
   }
   
-  // 初始化聊天记录
-  if (!matchChats.has(matchId)) {
-    matchChats.set(matchId, []);
+  const accessToken = session.token.accessToken;
+  const incomingMessage = createMatchChatMessage(player, message, messageType || "chat", {
+    origin: requestPlayerId ? "actor_message" : "player_message",
+  });
+
+  await getMatchChats(matchId, accessToken, { forceSync: true });
+
+  const shouldReply = !Boolean(skipAutoReply);
+  let autoReplies = [];
+  if (shouldReply) {
+    autoReplies = await generateSecondMeReplies(
+      accessToken,
+      match,
+      player,
+      incomingMessage.message,
+      incomingMessage.type
+    );
+    if (autoReplies.length === 0) {
+      autoReplies = buildFallbackReplies(match, player, incomingMessage.message, incomingMessage.type);
+    }
   }
-  
-  const chatMessage = {
-    id: Date.now().toString(),
-    playerId: player.id,
-    playerName: player.name,
-    message: message.trim().slice(0, 200),
-    timestamp: Date.now(),
-  };
-  
-  matchChats.get(matchId).push(chatMessage);
-  
-  // 只保留最近50条消息
-  const chats = matchChats.get(matchId);
-  if (chats.length > 50) {
-    matchChats.set(matchId, chats.slice(-50));
-  }
-  
-  res.json({ ok: true, message: chatMessage });
+
+  const mergedChats = await appendMatchChats(matchId, accessToken, [incomingMessage, ...autoReplies]);
+  res.json({ ok: true, message: incomingMessage, replies: autoReplies, chats: mergedChats.slice(-50) });
 });
 
 // 获取聊天消息
@@ -5015,8 +5389,14 @@ app.get("/api/match/:matchId/chat", async (req, res) => {
     return;
   }
   
-  const chats = matchChats.get(matchId) || [];
-  res.json({ ok: true, chats: chats });
+  const accessToken = session.token.accessToken;
+  await getMatchChats(matchId, accessToken, { forceSync: true });
+  const ambientMessage = maybeBuildAmbientMessage(match, session.user.id, matchId);
+  let chats = matchChats.get(matchId) || [];
+  if (ambientMessage) {
+    chats = await appendMatchChats(matchId, accessToken, [ambientMessage]);
+  }
+  res.json({ ok: true, chats: chats.slice(-50) });
 });
 
 app.get("/api/match/recommend", async (req, res) => {
@@ -5422,11 +5802,18 @@ app.get("/api/auth/callback", async (req, res) => {
       res.status(400).send(`<pre>${JSON.stringify(userJson, null, 2)}</pre><p><a href="/">返回首页</a></p>`);
       return;
     }
+    const remoteRankProgress = await loadRankProgressFromSecondMe(accessToken);
+    const localScore = Math.max(0, Number(existingSession?.rankProgress?.score) || RANK_INITIAL_EXP);
+    const mergedScore = remoteRankProgress ? Math.max(remoteRankProgress.score, localScore) : localScore;
+    const mergedRankProgress = createRankProgress(mergedScore);
+    if (!remoteRankProgress || remoteRankProgress.score !== mergedScore) {
+      await saveRankProgressToSecondMe(accessToken, mergedRankProgress);
+    }
     const sid = existingSid || crypto.randomBytes(24).toString("hex");
     const nextSession = {
       user: userJson.data,
       token: tokenJson.data,
-      rankProgress: createRankProgress(existingSession?.rankProgress?.score || 0),
+      rankProgress: mergedRankProgress,
       createdAt: existingSession?.createdAt || Date.now(),
     };
     await persistSession(req, res, sid, nextSession);
@@ -6285,7 +6672,11 @@ app.get("/", async (req, res) => {
 
 
 app.post("/api/ranked/result", async (req, res) => {
-  const { sid, session } = await getOrCreateSession(req, res);
+  const { sid, session } = await getSessionFromRequest(req);
+  if (!session?.user || !session?.token?.accessToken) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
   const outcome = String(req.body?.outcome || "");
   if (outcome !== "win" && outcome !== "loss") {
     res.status(400).json({ ok: false, error: "invalid_outcome" });
@@ -6295,12 +6686,15 @@ app.post("/api/ranked/result", async (req, res) => {
   const delta = outcome === "win" ? RANK_GAIN_WIN : RANK_GAIN_LOSS;
   rankProgress.score = Math.max(0, rankProgress.score + delta);
   rankProgress.updatedAt = Date.now();
+  const synced = await saveRankProgressToSecondMe(session.token.accessToken, rankProgress);
   await persistSession(req, res, sid || crypto.randomBytes(24).toString("hex"), session);
   res.json({
     ok: true,
     delta,
     outcome,
     rank: getRankMeta(rankProgress.score),
+    synced,
+    ...(synced ? {} : { warning: "rank_sync_failed" }),
   });
 });
 
