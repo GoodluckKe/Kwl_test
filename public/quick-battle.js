@@ -14,14 +14,12 @@
     { key: "discard", label: "弃牌" },
     { key: "end", label: "结束" },
   ];
-  const SEAT_POSITIONS = {
-    0: { left: 50, top: 84 },
-    1: { left: 25, top: 75 },
-    2: { left: 9, top: 54 },
-    3: { left: 24, top: 24 },
-    4: { left: 50, top: 14 },
-    5: { left: 76, top: 24 },
-    6: { left: 91, top: 54 },
+  const PLAYER_COUNT_OPTIONS = [5, 6, 7, 8];
+  const ROLE_DISTRIBUTION_BY_COUNT = {
+    5: ["lord", "loyalist", "rebel", "rebel", "spy"],
+    6: ["lord", "loyalist", "rebel", "rebel", "rebel", "spy"],
+    7: ["lord", "loyalist", "loyalist", "rebel", "rebel", "rebel", "spy"],
+    8: ["lord", "loyalist", "loyalist", "rebel", "rebel", "rebel", "rebel", "spy"],
   };
   const ACTIONABLE_DELAYED = new Set(["潘多拉魔盒", "斯芬克斯之谜", "世界树之缚"]);
   const SINGLE_TARGET = new Set(["神击", "灵药", "天罚", "神谕", "命运纺锤", "雷霆之怒", "潘多拉魔盒", "斯芬克斯之谜", "世界树之缚"]);
@@ -47,7 +45,13 @@
     rankEnabled: Boolean(boot.rankEnabled),
     rankProgress: boot.rankProgress || null,
     selectedHeroId: boot.selectedHeroId || "",
+    playerCount: 7,
   };
+  function normalizePlayerCount(value) {
+    const count = Number(value);
+    return PLAYER_COUNT_OPTIONS.includes(count) ? count : 7;
+  }
+  modeConfig.playerCount = normalizePlayerCount(boot.playerCount || (Array.isArray(boot.matchedPlayers) ? boot.matchedPlayers.length : 0));
 
   const state = {
     players: [],
@@ -67,6 +71,7 @@
     rankUpdate: null,
     turnTimer: null,
     timeLeft: 20,
+    seatCount: modeConfig.playerCount,
   };
 
   const refs = {
@@ -207,71 +212,86 @@
     return "";
   }
 
+  function rolePoolForCount(playerCount) {
+    const count = normalizePlayerCount(playerCount);
+    const pool = ROLE_DISTRIBUTION_BY_COUNT[count] || ROLE_DISTRIBUTION_BY_COUNT[7];
+    return shuffle(pool);
+  }
+
+  function seatPositionFor(seat, totalSeats) {
+    const count = normalizePlayerCount(totalSeats);
+    const radius = count >= 8 ? 38 : count <= 5 ? 32 : 35;
+    const angle = Math.PI / 2 + (2 * Math.PI * (Number(seat) % count)) / count;
+    const left = 50 + radius * Math.cos(angle);
+    const top = 49 + radius * Math.sin(angle);
+    return {
+      left: Math.max(8, Math.min(92, left)),
+      top: Math.max(12, Math.min(86, top)),
+    };
+  }
+
   function buildPlayers() {
-    const roles = shuffle(["lord", "loyalist", "loyalist", "rebel", "rebel", "rebel", "spy"]);
     const allHeroes = Array.isArray(boot.heroes) ? boot.heroes : [];
+    const matchedPlayers = Array.isArray(boot.matchedPlayers) ? boot.matchedPlayers : [];
+    const seatCount = normalizePlayerCount(modeConfig.playerCount || matchedPlayers.length);
+    state.seatCount = seatCount;
+    if (!allHeroes.length) return [];
+
+    const roles = rolePoolForCount(seatCount);
     const selectedHero = allHeroes.find((hero) => hero.id === modeConfig.selectedHeroId) || shuffle(allHeroes)[0];
-    const heroPool = shuffle(allHeroes.filter((hero) => hero.id !== selectedHero?.id)).slice(0, 6);
-    const playerRole = roles.shift();
-    const playerHero = selectedHero || heroPool.shift();
-    
-    // 如果有匹配的推荐用户信息，使用它
-    if (boot.matchedPlayers && boot.matchedPlayers.length > 0) {
-      const players = [];
-      const matchedPlayers = boot.matchedPlayers;
-      
-      // 第一个玩家是人类玩家
-      players.push(createPlayer(0, 0, playerRole, playerHero, true, boot.viewer?.name || '玩家'));
-      
-      const remainingSeats = [1, 2, 3, 4, 5, 6];
-      const shuffledSeats = shuffle(remainingSeats);
-      
-      // 添加匹配的其他用户
-      for (let i = 1; i < matchedPlayers.length && i < 7; i++) {
-        const matchedPlayer = matchedPlayers[i];
-        const hero = heroPool.length > 0 ? heroPool.shift() : shuffle(allHeroes)[0];
-        const role = roles.length > 0 ? roles.shift() : 'rebel';
-        const seat = shuffledSeats[i - 1] || i;
-        
-        players.push(createPlayer(i, seat, role, hero, matchedPlayer.isHuman || false, matchedPlayer.name || 'SecondMe用户'));
-      }
-      
-      // 如果人数不足7人，生成AI玩家
-      while (players.length < 7 && heroPool.length > 0) {
-        const hero = heroPool.shift();
-        const role = roles.length > 0 ? roles.shift() : 'rebel';
-        const seatIdx = players.length - 1;
-        const seat = shuffledSeats[seatIdx] || players.length;
-        players.push(createPlayer(players.length, seat, role, hero, false, 'AI玩家'));
-      }
-      
-      return players.sort((a, b) => a.seat - b.seat);
+    const heroPool = shuffle(allHeroes.filter((hero) => hero.id !== selectedHero?.id));
+    function nextHero() {
+      return heroPool.shift() || shuffle(allHeroes)[0];
     }
-    
-    // 原来的逻辑：生成AI玩家
+
+    const playerRole = roles.shift() || "rebel";
+    const playerHero = selectedHero || nextHero();
     const players = [
-      createPlayer(0, 0, playerRole, playerHero, true, boot.viewer?.name || '玩家'),
+      createPlayer(0, 0, playerRole, playerHero, true, boot.viewer?.name || "玩家"),
     ];
 
-    const remainingSeats = [1, 2, 3, 4, 5, 6];
-    const remainingHeroes = [...heroPool];
+    const viewerId = String(boot.viewer?.id || "");
+    const matchedOthers = matchedPlayers
+      .filter((entry) => entry && typeof entry === "object")
+      .filter((entry) => !(viewerId && String(entry.id || "") === viewerId))
+      .slice(0, Math.max(0, seatCount - 1));
+
+    const remainingSeats = Array.from({ length: Math.max(0, seatCount - 1) }, (_, idx) => idx + 1);
     const remainingRoles = [...roles];
+    let nextPlayerId = 1;
 
     if (playerRole !== "lord") {
       const lordIndex = remainingRoles.indexOf("lord");
-      const lordRole = remainingRoles.splice(lordIndex, 1)[0];
-      const lordHero = remainingHeroes.splice(0, 1)[0];
-      players.push(createPlayer(1, 4, lordRole, lordHero, false, 'AI玩家'));
-      const shuffledSeats = shuffle([1, 2, 3, 5, 6]);
-      remainingRoles.forEach((role, idx) => {
-        players.push(createPlayer(idx + 2, shuffledSeats[idx], role, remainingHeroes[idx], false, 'AI玩家'));
-      });
-    } else {
-      const shuffledSeats = shuffle(remainingSeats);
-      remainingRoles.forEach((role, idx) => {
-        players.push(createPlayer(idx + 1, shuffledSeats[idx], role, remainingHeroes[idx], false, 'AI玩家'));
-      });
+      if (lordIndex >= 0 && remainingSeats.length > 0) {
+        const lordRole = remainingRoles.splice(lordIndex, 1)[0];
+        const oppositeSeat = Math.floor(seatCount / 2);
+        const seatIndex = Math.max(0, remainingSeats.indexOf(oppositeSeat));
+        const [lordSeat] = remainingSeats.splice(seatIndex, 1);
+        const matched = matchedOthers.shift();
+        const isHuman = Boolean(matched && viewerId && String(matched.id || "") === viewerId);
+        const displayName = matched?.name
+          ? String(matched.name)
+          : isHuman
+          ? "SecondMe玩家"
+          : `AI玩家${nextPlayerId}`;
+        players.push(createPlayer(nextPlayerId, lordSeat, lordRole, nextHero(), isHuman, displayName));
+        nextPlayerId += 1;
+      }
     }
+
+    const shuffledSeats = shuffle(remainingSeats);
+    shuffledSeats.forEach((seat) => {
+      const role = remainingRoles.shift() || "rebel";
+      const matched = matchedOthers.shift();
+      const isHuman = Boolean(matched && viewerId && String(matched.id || "") === viewerId);
+      const displayName = matched?.name
+        ? String(matched.name)
+        : isHuman
+        ? "SecondMe玩家"
+        : `AI玩家${nextPlayerId}`;
+      players.push(createPlayer(nextPlayerId, seat, role, nextHero(), isHuman, displayName));
+      nextPlayerId += 1;
+    });
 
     return players.sort((a, b) => a.seat - b.seat);
   }
@@ -368,7 +388,8 @@
 
   function seatDistance(a, b) {
     const raw = Math.abs(a.seat - b.seat);
-    let distance = Math.min(raw, 7 - raw);
+    const tableSize = Math.max(2, state.players.length || state.seatCount || 7);
+    let distance = Math.min(raw, tableSize - raw);
     if (b.equip.plusHorse && b.equip.plusHorse.name === "神驹·斯莱普尼尔") distance += 1;
     if (b.equip.armor && b.equip.armor.name === "冥河渡船") distance += 1;
     if (a.equip.minusHorse && a.equip.minusHorse.name === "神驹·日车") distance -= 1;
@@ -394,8 +415,9 @@
   }
 
   function nextLivingSeat(fromSeat) {
-    for (let i = 1; i <= 7; i += 1) {
-      const seat = (fromSeat + i) % 7;
+    const tableSize = Math.max(2, state.players.length || state.seatCount || 7);
+    for (let i = 1; i <= tableSize; i += 1) {
+      const seat = (fromSeat + i) % tableSize;
       const target = state.players.find((player) => player.seat === seat);
       if (target && !target.dead) return target;
     }
@@ -1031,7 +1053,7 @@
         maxHp: p.maxHp,
         isHuman: p.isHuman,
         role: p.role,
-        distance: Math.abs(p.seat - actor.seat) <= 3 ? Math.abs(p.seat - actor.seat) : 6 - Math.abs(p.seat - actor.seat),
+        distance: p.id === actor.id ? 0 : seatDistance(actor, p),
       })),
       drawPileCount: state.drawPile.length,
       discardPileCount: state.discardPile.length,
@@ -1298,7 +1320,7 @@
     const card = selectedCard();
     const validTargets = human && card ? validTargetsForCard(human, card) : [];
     refs.arena.innerHTML = state.players.map((player) => {
-      const pos = SEAT_POSITIONS[player.seat];
+      const pos = seatPositionFor(player.seat, state.seatCount || state.players.length);
       const classes = [
         "qb-seat",
         player.isHuman ? "self" : "",
